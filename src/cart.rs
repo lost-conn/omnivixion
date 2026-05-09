@@ -203,15 +203,28 @@ const TITLE_MAX_CHARS: i32 = 16;
 
 const COLOR_FLOOR:  u8 = 4;   // grass — empty corridor
 const COLOR_WALL:   u8 = 8;   // stone
-const COLOR_PELLET: u8 = 11;  // yellow
-const COLOR_PLAYER: u8 = 12;  // orange
-const COLOR_GHOST: [u8; 3] = [13, 14, 15]; // red, pink, purple
+const COLOR_PELLET: u8 = 10;  // snow/white — small dots on the floor
+const COLOR_PLAYER: u8 = 11;  // yellow — classic pacman
+// Ghost colors keyed to GhostBehavior order: Blinky red, Pinky pink, Inky blue, Clyde orange.
+const COLOR_GHOST: [u8; 4] = [13, 14, 2, 12];
 
 // Sprite bank IDs used by the pacman cart.
 const SPR_WALL:   u8 = 0;
 const SPR_FLOOR:  u8 = 1;
 const SPR_PLAYER: u8 = 3;
-const SPR_GHOST_BASE: u8 = 4; // 4..6 used by the 3 current ghosts (phase A keeps the count)
+const SPR_GHOST_BASE: u8 = 4; // 4..7 — one per ghost behavior
+
+// Classic pacman scatter/chase schedule. Frame counts are 60 Hz.
+const PHASE_SCHEDULE: &[(GamePhase, u64)] = &[
+    (GamePhase::Scatter, 420),  // 7s
+    (GamePhase::Chase,   1200), // 20s
+    (GamePhase::Scatter, 420),
+    (GamePhase::Chase,   1200),
+    (GamePhase::Scatter, 300),  // 5s
+    (GamePhase::Chase,   1200),
+    (GamePhase::Scatter, 300),
+    (GamePhase::Chase,   u64::MAX), // indefinite
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tile {
@@ -227,21 +240,60 @@ enum GameState {
     Lost,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GhostBehavior {
+    Blinky, // red, direct chase
+    Pinky,  // pink, 4 tiles ahead of player heading
+    Inky,   // blue, vector from Blinky through (player + 2 ahead)
+    Clyde,  // orange, chase at distance, scatter when close
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Frightened/Eaten land in phase C
+enum GhostMode {
+    Normal,
+    Frightened,
+    Eaten,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GamePhase {
+    Scatter,
+    Chase,
+}
+
 struct Ghost {
     tx: i32,
     tz: i32,
     color: u8,
     last_dir: (i32, i32),
+    behavior: GhostBehavior,
+    mode: GhostMode,
+    home_corner: (i32, i32),
+    spawn: (i32, i32),
 }
 
 pub struct PacmanCart {
     maze: Vec<Vec<Tile>>,
     player_tx: i32,
     player_tz: i32,
+    /// Last direction the player successfully moved in tile coords. Used by
+    /// Pinky/Inky targeting. Defaults to (0, -1) so the first chase has a
+    /// well-defined heading.
+    player_dir: (i32, i32),
     ghosts: Vec<Ghost>,
     pellets_remaining: u32,
     score: u32,
     state: GameState,
+    phase: GamePhase,
+    phase_timer: u64,
+    phase_index: usize,
+    /// Phase C: counts down while ghosts are Frightened. Pauses phase_timer.
+    #[allow(dead_code)]
+    frightened_timer: u64,
+    /// Phase C: consecutive ghosts eaten in current Frightened spell.
+    #[allow(dead_code)]
+    ghost_chain: u8,
     rng: u64,
     last_player_move: u64,
     last_ghost_move: u64,
@@ -254,10 +306,16 @@ impl PacmanCart {
             maze: Vec::new(),
             player_tx: 0,
             player_tz: 0,
+            player_dir: (0, -1),
             ghosts: Vec::new(),
             pellets_remaining: 0,
             score: 0,
             state: GameState::Playing,
+            phase: GamePhase::Scatter,
+            phase_timer: 0,
+            phase_index: 0,
+            frightened_timer: 0,
+            ghost_chain: 0,
             rng: 0xDEAD_BEEF_CAFE_BABE,
             last_player_move: 0,
             last_ghost_move: 0,
@@ -357,51 +415,84 @@ impl PacmanCart {
             self.score += 10;
         }
 
+        self.player_dir = (dx, dz);
+
         self.render_player(api);
         true
     }
 
+    /// Compute the target tile for ghost `gi` given the current phase, player
+    /// position, and player heading. Phase C will branch on Frightened/Eaten.
+    fn target_for_ghost(&self, gi: usize) -> (i32, i32) {
+        let g = &self.ghosts[gi];
+        if self.phase == GamePhase::Scatter {
+            return g.home_corner;
+        }
+        match g.behavior {
+            GhostBehavior::Blinky => (self.player_tx, self.player_tz),
+            GhostBehavior::Pinky => (
+                self.player_tx + self.player_dir.0 * 4,
+                self.player_tz + self.player_dir.1 * 4,
+            ),
+            GhostBehavior::Inky => {
+                let blinky = self
+                    .ghosts
+                    .iter()
+                    .find(|g| g.behavior == GhostBehavior::Blinky)
+                    .map(|b| (b.tx, b.tz))
+                    .unwrap_or((0, 0));
+                let pivot_x = self.player_tx + self.player_dir.0 * 2;
+                let pivot_z = self.player_tz + self.player_dir.1 * 2;
+                (2 * pivot_x - blinky.0, 2 * pivot_z - blinky.1)
+            }
+            GhostBehavior::Clyde => {
+                let dx = g.tx - self.player_tx;
+                let dz = g.tz - self.player_tz;
+                if dx.abs() + dz.abs() > 8 {
+                    (self.player_tx, self.player_tz)
+                } else {
+                    g.home_corner
+                }
+            }
+        }
+    }
+
     fn move_ghost(&mut self, gi: usize, api: &mut dyn CartApi) {
-        let player = (self.player_tx, self.player_tz);
+        let target = self.target_for_ghost(gi);
         let g_tx = self.ghosts[gi].tx;
         let g_tz = self.ghosts[gi].tz;
         let last_dir = self.ghosts[gi].last_dir;
         let avoid = (-last_dir.0, -last_dir.1);
-        let dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+        // Canonical pacman tiebreak order: up > left > down > right.
+        let dirs = [(0, -1), (-1, 0), (0, 1), (1, 0)];
 
-        let mut best: Option<(i32, (i32, i32))> = None;
-        for &(dx, dz) in &dirs {
-            let nx = g_tx + dx;
-            let nz = g_tz + dz;
-            if !in_bounds(nx, nz) { continue; }
-            if self.maze[nx as usize][nz as usize] == Tile::Wall { continue; }
-            if (dx, dz) == avoid { continue; }
-            let dist = (nx - player.0).abs() + (nz - player.1).abs();
-            match best {
-                None => best = Some((dist, (dx, dz))),
-                Some((d, _)) if dist < d => best = Some((dist, (dx, dz))),
-                Some((d, _)) if dist == d && (self.rng_step() & 1) == 0 => {
-                    best = Some((dist, (dx, dz)));
-                }
-                _ => {}
-            }
-        }
-        if best.is_none() {
-            // Cornered: allow reverse.
-            for &(dx, dz) in &dirs {
+        let pick_best = |dirs_iter: &[(i32, i32)], allow_reverse: bool| -> Option<(i32, i32)> {
+            let mut best: Option<(i32, (i32, i32))> = None;
+            for &(dx, dz) in dirs_iter {
                 let nx = g_tx + dx;
                 let nz = g_tz + dz;
-                if !in_bounds(nx, nz) { continue; }
-                if self.maze[nx as usize][nz as usize] == Tile::Wall { continue; }
-                let dist = (nx - player.0).abs() + (nz - player.1).abs();
-                match best {
-                    None => best = Some((dist, (dx, dz))),
-                    Some((d, _)) if dist < d => best = Some((dist, (dx, dz))),
-                    _ => {}
+                if !in_bounds(nx, nz) {
+                    continue;
+                }
+                if self.maze[nx as usize][nz as usize] == Tile::Wall {
+                    continue;
+                }
+                if !allow_reverse && (dx, dz) == avoid {
+                    continue;
+                }
+                // Squared Euclidean distance — matches classic pacman.
+                let dx_t = nx - target.0;
+                let dz_t = nz - target.1;
+                let dist = dx_t * dx_t + dz_t * dz_t;
+                if best.map_or(true, |(d, _)| dist < d) {
+                    best = Some((dist, (dx, dz)));
                 }
             }
-        }
-        let Some((_, (dx, dz))) = best else { return };
+            best.map(|(_, d)| d)
+        };
+
+        let chosen = pick_best(&dirs, false).or_else(|| pick_best(&dirs, true));
+        let Some((dx, dz)) = chosen else { return };
 
         // Clear the ghost's old 4³ box and re-stamp the underlying tile.
         let (ox, oz) = Self::tile_to_world(g_tx, g_tz);
@@ -414,6 +505,19 @@ impl PacmanCart {
         g.last_dir = (dx, dz);
 
         self.render_ghost(gi, api);
+    }
+
+    fn advance_phase(&mut self) {
+        let next = (self.phase_index + 1).min(PHASE_SCHEDULE.len() - 1);
+        self.phase_index = next;
+        let (phase, duration) = PHASE_SCHEDULE[next];
+        self.phase = phase;
+        self.phase_timer = duration;
+        // Classic: ghosts reverse direction on phase change so the new target
+        // pulls them away from where they were headed.
+        for g in &mut self.ghosts {
+            g.last_dir = (-g.last_dir.0, -g.last_dir.1);
+        }
     }
 
     fn rng_step(&mut self) -> u64 {
@@ -510,11 +614,17 @@ impl Cart for PacmanCart {
         // Static sprites: wall + floor blocks.
         let _ = api.spr_load(SPR_WALL,  4, &make_solid_sprite_4(COLOR_WALL));
         let _ = api.spr_load(SPR_FLOOR, 4, &make_solid_sprite_4(COLOR_FLOOR));
-        // Entity sprites.
+        // Entity sprites — one per behavior, color tied to COLOR_GHOST.
         let _ = api.spr_load(SPR_PLAYER, 4, &make_solid_sprite_4(COLOR_PLAYER));
         for (i, &c) in COLOR_GHOST.iter().enumerate() {
             let _ = api.spr_load(SPR_GHOST_BASE + i as u8, 4, &make_solid_sprite_4(c));
         }
+
+        // Start in the first scatter phase.
+        self.phase_index = 0;
+        let (phase, duration) = PHASE_SCHEDULE[0];
+        self.phase = phase;
+        self.phase_timer = duration;
 
         self.maze = generate_maze();
         let n = MAZE_SIZE;
@@ -532,12 +642,36 @@ impl Cart for PacmanCart {
         self.player_tx = n / 2;
         self.player_tz = n / 2;
 
-        // 3 ghosts at far corners so the player has space to plan.
-        self.ghosts = vec![
-            Ghost { tx: 1,         tz: 1,         color: COLOR_GHOST[0], last_dir: (0, 0) },
-            Ghost { tx: n - 2,     tz: 1,         color: COLOR_GHOST[1], last_dir: (0, 0) },
-            Ghost { tx: 1,         tz: n - 2,     color: COLOR_GHOST[2], last_dir: (0, 0) },
+        // 4 ghosts, one per behavior, each at its assigned corner. The corners
+        // double as `home_corner` (scatter target) and `spawn` (return-to when
+        // eaten in phase C).
+        let corners = [
+            (n - 2, 1),       // Blinky — top-right
+            (1, 1),           // Pinky — top-left
+            (n - 2, n - 2),   // Inky — bottom-right
+            (1, n - 2),       // Clyde — bottom-left
         ];
+        let behaviors = [
+            GhostBehavior::Blinky,
+            GhostBehavior::Pinky,
+            GhostBehavior::Inky,
+            GhostBehavior::Clyde,
+        ];
+        self.ghosts = behaviors
+            .iter()
+            .zip(corners.iter())
+            .enumerate()
+            .map(|(i, (&behavior, &corner))| Ghost {
+                tx: corner.0,
+                tz: corner.1,
+                color: COLOR_GHOST[i],
+                last_dir: (0, 0),
+                behavior,
+                mode: GhostMode::Normal,
+                home_corner: corner,
+                spawn: corner,
+            })
+            .collect();
 
         self.render_static_world(api);
         self.render_player(api);
@@ -605,6 +739,14 @@ impl Cart for PacmanCart {
             }
             self.last_ghost_move = t;
             self.check_end();
+        }
+
+        // Advance the scatter/chase phase clock.
+        if self.phase_timer != u64::MAX {
+            self.phase_timer = self.phase_timer.saturating_sub(1);
+            if self.phase_timer == 0 {
+                self.advance_phase();
+            }
         }
     }
 }
