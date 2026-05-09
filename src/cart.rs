@@ -197,10 +197,15 @@ const MAZE_X0: i32 = 32;
 const MAZE_Z0: i32 = 32;
 const GAME_Y: i32 = 2;
 
-const PLAYER_PERIOD:    u64 = 8;   // frames between player moves while a key is held
-const GHOST_PERIOD:     u64 = 18;  // Normal-mode ghost move period
-const FRIGHT_PERIOD:    u64 = 28;  // Frightened-mode is slower
-const EATEN_PERIOD:     u64 = 8;   // Eaten ghosts return to spawn fast
+// Movement is animated as 4 sub-steps per tile move (each sub-step is one
+// RD-neighbor offset; the chain of 4 nets to a cardinal stride). Tile-move
+// periods MUST be multiples of SUB_STEPS so the per-sub-step frame budget is
+// integer.
+const SUB_STEPS:        u8  = 4;
+const PLAYER_PERIOD:    u64 = 8;   // 2 frames / sub-step — full tile in 8 frames
+const GHOST_PERIOD:     u64 = 20;  // Normal-mode ghost: 5 frames / sub-step
+const FRIGHT_PERIOD:    u64 = 28;  // Frightened: 7 frames / sub-step (slower)
+const EATEN_PERIOD:     u64 = 8;   // Eaten ghosts return to spawn fast (2 / sub-step)
 const INTRO_GRACE:      u64 = 60;  // ghosts hold still for 1 second after game start
 const FRIGHT_DURATION:  u64 = 360; // 6s of Frightened mode after a power pellet
 
@@ -288,6 +293,18 @@ enum GamePhase {
     Chase,
 }
 
+/// In-flight tile-to-tile move. The entity's logical tile is `(src_tx, src_tz)`
+/// until `sub_step` reaches `SUB_STEPS`, at which point we finalize the move.
+/// Each sub-step is an RD-neighbor offset that nets `dir * 4` after 4 sub-steps.
+#[derive(Clone, Copy, Debug)]
+struct Anim {
+    src_tx: i32,
+    src_tz: i32,
+    dir: (i32, i32), // tile-direction: ±x or ±z
+    sub_step: u8,    // 0 = at src, advances on each sub-step boundary
+    sub_frame: u64,  // frames into the current sub_step
+}
+
 struct Ghost {
     tx: i32,
     tz: i32,
@@ -297,19 +314,22 @@ struct Ghost {
     mode: GhostMode,
     home_corner: (i32, i32),
     spawn: (i32, i32),
-    /// Global tick at which this ghost last moved. Per-ghost so Eaten and
-    /// Frightened can tick at different cadences.
-    last_move: u64,
+    anim: Option<Anim>,
 }
 
 pub struct PacmanCart {
     maze: Vec<Vec<Tile>>,
     player_tx: i32,
     player_tz: i32,
-    /// Last direction the player successfully moved in tile coords. Used by
-    /// Pinky/Inky targeting. Defaults to (0, -1) so the first chase has a
-    /// well-defined heading.
+    /// Direction the player most recently committed to. Used for Pinky/Inky
+    /// targeting and as the "keep going" fallback at tile boundaries.
     player_dir: (i32, i32),
+    /// Last direction the user requested via input. At each tile boundary the
+    /// player tries this first, then falls back to player_dir.
+    desired_dir: (i32, i32),
+    /// Animation state for the player's current tile-to-tile move; None when
+    /// stopped at a tile (wall ahead and no valid input).
+    player_anim: Option<Anim>,
     ghosts: Vec<Ghost>,
     pellets_remaining: u32,
     score: u32,
@@ -328,7 +348,6 @@ pub struct PacmanCart {
     last_drawn_score: Option<u32>,
     last_drawn_lives: Option<u8>,
     rng: u64,
-    last_player_move: u64,
     announced_end: bool,
 }
 
@@ -338,7 +357,9 @@ impl PacmanCart {
             maze: Vec::new(),
             player_tx: 0,
             player_tz: 0,
-            player_dir: (0, -1),
+            player_dir: (0, 0),
+            desired_dir: (0, 0),
+            player_anim: None,
             ghosts: Vec::new(),
             pellets_remaining: 0,
             score: 0,
@@ -353,7 +374,6 @@ impl PacmanCart {
             last_drawn_score: None,
             last_drawn_lives: None,
             rng: 0xDEAD_BEEF_CAFE_BABE,
-            last_player_move: 0,
             announced_end: false,
         }
     }
@@ -388,8 +408,37 @@ impl PacmanCart {
     }
 
     /// Clear an entity sprite's 4³ bounding box at the given world anchor.
-    fn clear_entity_box(ax: i32, az: i32, api: &mut dyn CartApi) {
-        api.vox_fill(ax, GAME_Y, az, ax + 3, GAME_Y + 3, az + 3, 0);
+    fn clear_entity_box(ax: i32, ay: i32, az: i32, api: &mut dyn CartApi) {
+        api.vox_fill(ax, ay, az, ax + 3, ay + 3, az + 3, 0);
+    }
+
+    /// World anchor for the entity's sprite given an animation state. Even
+    /// sub-steps are at GAME_Y (ground); odd sub-steps bob 1 cell in y, which
+    /// is the parity-preserving way to make a "1-cell" axis-aligned move
+    /// visible on the FCC lattice.
+    fn anim_anchor(anim: &Anim) -> (i32, i32, i32) {
+        let (sx, sz) = Self::tile_to_world(anim.src_tx, anim.src_tz);
+        let n = anim.sub_step as i32;
+        let bob = (anim.sub_step & 1) as i32;
+        (sx + n * anim.dir.0, GAME_Y + bob, sz + n * anim.dir.1)
+    }
+
+    /// Anchor for an entity sitting still on a tile.
+    fn idle_anchor(tx: i32, tz: i32) -> (i32, i32, i32) {
+        let (sx, sz) = Self::tile_to_world(tx, tz);
+        (sx, GAME_Y, sz)
+    }
+
+    fn frames_per_sub_step_player(&self) -> u64 {
+        PLAYER_PERIOD / SUB_STEPS as u64
+    }
+    fn frames_per_sub_step_ghost(mode: GhostMode) -> u64 {
+        let period = match mode {
+            GhostMode::Normal => GHOST_PERIOD,
+            GhostMode::Frightened => FRIGHT_PERIOD,
+            GhostMode::Eaten => EATEN_PERIOD,
+        };
+        period / SUB_STEPS as u64
     }
 
     /// Clear the title bbox and stamp `s` (≤ TITLE_MAX_CHARS) on a horizontal
@@ -443,17 +492,20 @@ impl PacmanCart {
     /// Frightened/Eaten state, and start a brief grace window before ghosts move
     /// again. Pellets and score persist.
     fn soft_reset(&mut self, t: u64, api: &mut dyn CartApi) {
-        let (px, pz) = Self::tile_to_world(self.player_tx, self.player_tz);
-        Self::clear_entity_box(px, pz, api);
+        // Clear at the entity's current visual anchor (which may be mid-anim).
+        let (px, py, pz) = self.player_anchor();
+        Self::clear_entity_box(px, py, pz, api);
         self.stamp_tile(self.player_tx, self.player_tz, api);
 
         self.player_tx = MAZE_SIZE / 2;
         self.player_tz = MAZE_SIZE / 2;
-        self.player_dir = (0, -1);
+        self.player_dir = (0, 0);
+        self.desired_dir = (0, 0);
+        self.player_anim = None;
 
         for gi in 0..self.ghosts.len() {
-            let (gx, gz) = Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
-            Self::clear_entity_box(gx, gz, api);
+            let (gx, gy, gz) = self.ghost_anchor(gi);
+            Self::clear_entity_box(gx, gy, gz, api);
             self.stamp_tile(self.ghosts[gi].tx, self.ghosts[gi].tz, api);
 
             let g = &mut self.ghosts[gi];
@@ -461,7 +513,7 @@ impl PacmanCart {
             g.tz = g.spawn.1;
             g.last_dir = (0, 0);
             g.mode = GhostMode::Normal;
-            g.last_move = t;
+            g.anim = None;
         }
 
         self.frightened_timer = 0;
@@ -483,53 +535,76 @@ impl PacmanCart {
         }
     }
 
+    fn player_anchor(&self) -> (i32, i32, i32) {
+        match &self.player_anim {
+            Some(anim) => Self::anim_anchor(anim),
+            None => Self::idle_anchor(self.player_tx, self.player_tz),
+        }
+    }
+    fn ghost_anchor(&self, gi: usize) -> (i32, i32, i32) {
+        let g = &self.ghosts[gi];
+        match &g.anim {
+            Some(anim) => Self::anim_anchor(anim),
+            None => Self::idle_anchor(g.tx, g.tz),
+        }
+    }
+
     fn render_player(&self, api: &mut dyn CartApi) {
-        let (x, z) = Self::tile_to_world(self.player_tx, self.player_tz);
-        api.spr_draw(SPR_PLAYER, x, GAME_Y, z);
+        let (x, y, z) = self.player_anchor();
+        api.spr_draw(SPR_PLAYER, x, y, z);
     }
 
     fn render_ghost(&self, gi: usize, api: &mut dyn CartApi) {
         let g = &self.ghosts[gi];
-        let (x, z) = Self::tile_to_world(g.tx, g.tz);
         let sprite_id = match g.mode {
             GhostMode::Normal => SPR_GHOST_BASE + gi as u8,
             GhostMode::Frightened => SPR_FRIGHT,
             GhostMode::Eaten => SPR_EATEN,
         };
-        api.spr_draw(sprite_id, x, GAME_Y, z);
+        let (x, y, z) = self.ghost_anchor(gi);
+        api.spr_draw(sprite_id, x, y, z);
     }
 
-    /// Per-ghost move period — Normal is the baseline, Frightened slower,
-    /// Eaten faster (beelining for spawn).
-    fn ghost_period(&self, gi: usize) -> u64 {
-        match self.ghosts[gi].mode {
-            GhostMode::Normal => GHOST_PERIOD,
-            GhostMode::Frightened => FRIGHT_PERIOD,
-            GhostMode::Eaten => EATEN_PERIOD,
+    /// Returns true if the tile in `dir` from `(tx, tz)` is traversable.
+    fn can_move_to(&self, tx: i32, tz: i32, dir: (i32, i32)) -> bool {
+        let nx = tx + dir.0;
+        let nz = tz + dir.1;
+        if !in_bounds(nx, nz) {
+            return false;
         }
+        self.maze[nx as usize][nz as usize] != Tile::Wall
     }
 
-    fn try_move_player(&mut self, dx: i32, dz: i32, api: &mut dyn CartApi) -> bool {
-        let new_tx = self.player_tx + dx;
-        let new_tz = self.player_tz + dz;
-        if !in_bounds(new_tx, new_tz) {
+    /// Try to start a new player animation in `dir`. Returns true if started.
+    fn start_player_move(&mut self, dir: (i32, i32)) -> bool {
+        if dir == (0, 0) {
             return false;
         }
-        let new_tile = self.maze[new_tx as usize][new_tz as usize];
-        if new_tile == Tile::Wall {
+        if !self.can_move_to(self.player_tx, self.player_tz, dir) {
             return false;
         }
-        // Clear the old tile's 4³ box and re-stamp the underlying static tile.
-        let old_tx = self.player_tx;
-        let old_tz = self.player_tz;
-        let (ox, oz) = Self::tile_to_world(old_tx, old_tz);
-        Self::clear_entity_box(ox, oz, api);
-        self.stamp_tile(old_tx, old_tz, api);
+        self.player_anim = Some(Anim {
+            src_tx: self.player_tx,
+            src_tz: self.player_tz,
+            dir,
+            sub_step: 0,
+            sub_frame: 0,
+        });
+        self.player_dir = dir;
+        true
+    }
 
+    /// Run after the player's animation reaches sub_step == SUB_STEPS. Advances
+    /// the logical tile, eats pellets, checks collision, and decides what's next.
+    fn finalize_player_arrival(&mut self, t: u64, api: &mut dyn CartApi) {
+        let anim = self.player_anim.expect("finalize called without active anim");
+        let new_tx = anim.src_tx + anim.dir.0;
+        let new_tz = anim.src_tz + anim.dir.1;
         self.player_tx = new_tx;
         self.player_tz = new_tz;
+        self.player_anim = None;
 
-        match new_tile {
+        match self.maze[new_tx as usize][new_tz as usize] {
             Tile::Pellet => {
                 self.maze[new_tx as usize][new_tz as usize] = Tile::Empty;
                 self.pellets_remaining -= 1;
@@ -544,10 +619,66 @@ impl PacmanCart {
             _ => {}
         }
 
-        self.player_dir = (dx, dz);
+        self.check_end(t, api);
+        if self.state != GameState::Playing {
+            return;
+        }
 
+        // Classic controls: at each tile boundary, prefer the most recently
+        // requested direction; if it's blocked, keep going in player_dir;
+        // if that's blocked too, stop.
+        let desired = self.desired_dir;
+        if desired != (0, 0) && desired != self.player_dir
+            && self.can_move_to(self.player_tx, self.player_tz, desired)
+        {
+            self.start_player_move(desired);
+        } else if self.player_dir != (0, 0)
+            && self.can_move_to(self.player_tx, self.player_tz, self.player_dir)
+        {
+            let dir = self.player_dir;
+            self.start_player_move(dir);
+        }
+        // else: stop. player_anim stays None.
+    }
+
+    /// Advance the player's animation by one frame.
+    fn tick_player_anim(&mut self, t: u64, api: &mut dyn CartApi) {
+        let Some(mut anim) = self.player_anim else { return };
+        let fpss = self.frames_per_sub_step_player();
+        anim.sub_frame += 1;
+        if anim.sub_frame < fpss {
+            // Still inside this sub-step — no visual update needed.
+            self.player_anim = Some(anim);
+            return;
+        }
+        // Sub-step boundary reached. Tear down the previous render and either
+        // render at the next sub-step position or finalize the move.
+        let prev = Self::anim_anchor(&anim);
+        Self::clear_entity_box(prev.0, prev.1, prev.2, api);
+        // Stamp source tile (now vacated) and the imminent destination tile so
+        // their static contents (pellets, walls) re-render under the entity.
+        self.stamp_tile(anim.src_tx, anim.src_tz, api);
+        let dst_tx = anim.src_tx + anim.dir.0;
+        let dst_tz = anim.src_tz + anim.dir.1;
+        if in_bounds(dst_tx, dst_tz) {
+            self.stamp_tile(dst_tx, dst_tz, api);
+        }
+
+        anim.sub_frame = 0;
+        anim.sub_step += 1;
+
+        if anim.sub_step >= SUB_STEPS {
+            // Arrived at the destination tile — write back, eat pellets, etc.
+            self.player_anim = Some(anim);
+            self.finalize_player_arrival(t, api);
+            // Whether or not a fresh anim was started, the player needs to be
+            // drawn on top of any underlying tile content.
+            self.render_player(api);
+            return;
+        }
+
+        self.player_anim = Some(anim);
         self.render_player(api);
-        true
     }
 
     /// Flip every Normal-mode ghost into Frightened, restart the chain counter,
@@ -558,11 +689,13 @@ impl PacmanCart {
         for gi in 0..self.ghosts.len() {
             if self.ghosts[gi].mode == GhostMode::Normal {
                 self.ghosts[gi].mode = GhostMode::Frightened;
-                // Reverse direction (classic) and re-render with the blue sprite.
+                // Reverse direction (classic). If mid-anim, also flip the anim.
                 let (dx, dz) = self.ghosts[gi].last_dir;
                 self.ghosts[gi].last_dir = (-dx, -dz);
-                let (gx, gz) = Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
-                Self::clear_entity_box(gx, gz, api);
+                self.ghosts[gi].anim = None;
+                let (gx, gy, gz) = self.ghost_anchor(gi);
+                Self::clear_entity_box(gx, gy, gz, api);
+                self.stamp_tile(self.ghosts[gi].tx, self.ghosts[gi].tz, api);
                 self.render_ghost(gi, api);
             }
         }
@@ -688,42 +821,100 @@ impl PacmanCart {
         Some(valid[idx])
     }
 
-    fn move_ghost(&mut self, gi: usize, api: &mut dyn CartApi) {
+    /// AI: pick which direction the ghost should head from its current tile.
+    fn ghost_pick_dir(&mut self, gi: usize) -> Option<(i32, i32)> {
         let mode = self.ghosts[gi].mode;
-        let chosen = match mode {
+        match mode {
             GhostMode::Normal => self.pick_best_toward(gi, self.target_for_ghost(gi)),
             GhostMode::Eaten => {
                 let spawn = self.ghosts[gi].spawn;
                 self.pick_best_toward(gi, spawn)
             }
             GhostMode::Frightened => self.pick_random_neighbor(gi),
-        };
-        let Some((dx, dz)) = chosen else { return };
-
-        let g_tx = self.ghosts[gi].tx;
-        let g_tz = self.ghosts[gi].tz;
-        let (ox, oz) = Self::tile_to_world(g_tx, g_tz);
-        Self::clear_entity_box(ox, oz, api);
-        self.stamp_tile(g_tx, g_tz, api);
-
-        let g = &mut self.ghosts[gi];
-        g.tx += dx;
-        g.tz += dz;
-        g.last_dir = (dx, dz);
-
-        self.render_ghost(gi, api);
-
-        // Eaten → reached spawn? Flip back to Normal and re-render with the
-        // normal-color sprite right away.
-        if mode == GhostMode::Eaten {
-            let g = &self.ghosts[gi];
-            if (g.tx, g.tz) == g.spawn {
-                self.ghosts[gi].mode = GhostMode::Normal;
-                let (gx, gz) = Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
-                Self::clear_entity_box(gx, gz, api);
-                self.render_ghost(gi, api);
-            }
         }
+    }
+
+    /// Start a fresh ghost animation in `dir` from the ghost's current tile.
+    fn start_ghost_move(&mut self, gi: usize, dir: (i32, i32)) -> bool {
+        let g = &mut self.ghosts[gi];
+        if !in_bounds(g.tx + dir.0, g.tz + dir.1) {
+            return false;
+        }
+        if self.maze[(g.tx + dir.0) as usize][(g.tz + dir.1) as usize] == Tile::Wall {
+            return false;
+        }
+        g.anim = Some(Anim {
+            src_tx: g.tx,
+            src_tz: g.tz,
+            dir,
+            sub_step: 0,
+            sub_frame: 0,
+        });
+        g.last_dir = dir;
+        true
+    }
+
+    fn finalize_ghost_arrival(&mut self, gi: usize, t: u64, api: &mut dyn CartApi) {
+        let anim = self
+            .ghosts[gi]
+            .anim
+            .expect("finalize called without active ghost anim");
+        let new_tx = anim.src_tx + anim.dir.0;
+        let new_tz = anim.src_tz + anim.dir.1;
+        let g = &mut self.ghosts[gi];
+        g.tx = new_tx;
+        g.tz = new_tz;
+        g.anim = None;
+
+        // Eaten → reached spawn? Flip back to Normal in place. Don't pick a new
+        // direction this tick; the next tick's AI will start movement again.
+        if g.mode == GhostMode::Eaten && (g.tx, g.tz) == g.spawn {
+            g.mode = GhostMode::Normal;
+            return;
+        }
+
+        self.check_end(t, api);
+        if self.state != GameState::Playing {
+            return;
+        }
+
+        // Pick the next direction immediately so the ghost is constantly in
+        // motion (no idle frames between tile arrivals).
+        if let Some(next_dir) = self.ghost_pick_dir(gi) {
+            self.start_ghost_move(gi, next_dir);
+        }
+    }
+
+    fn tick_ghost_anim(&mut self, gi: usize, t: u64, api: &mut dyn CartApi) {
+        let Some(mut anim) = self.ghosts[gi].anim else { return };
+        let fpss = Self::frames_per_sub_step_ghost(self.ghosts[gi].mode);
+        anim.sub_frame += 1;
+        if anim.sub_frame < fpss {
+            self.ghosts[gi].anim = Some(anim);
+            return;
+        }
+
+        let prev = Self::anim_anchor(&anim);
+        Self::clear_entity_box(prev.0, prev.1, prev.2, api);
+        self.stamp_tile(anim.src_tx, anim.src_tz, api);
+        let dst_tx = anim.src_tx + anim.dir.0;
+        let dst_tz = anim.src_tz + anim.dir.1;
+        if in_bounds(dst_tx, dst_tz) {
+            self.stamp_tile(dst_tx, dst_tz, api);
+        }
+
+        anim.sub_frame = 0;
+        anim.sub_step += 1;
+
+        if anim.sub_step >= SUB_STEPS {
+            self.ghosts[gi].anim = Some(anim);
+            self.finalize_ghost_arrival(gi, t, api);
+            self.render_ghost(gi, api);
+            return;
+        }
+
+        self.ghosts[gi].anim = Some(anim);
+        self.render_ghost(gi, api);
     }
 
     fn advance_phase(&mut self) {
@@ -877,7 +1068,9 @@ impl PacmanCart {
     fn setup_world(&mut self, api: &mut dyn CartApi) {
         self.score = 0;
         self.lives = LIVES_START;
-        self.player_dir = (0, -1);
+        self.player_dir = (0, 0);
+        self.desired_dir = (0, 0);
+        self.player_anim = None;
         self.state = GameState::Playing;
         self.phase_index = 0;
         let (phase, duration) = PHASE_SCHEDULE[0];
@@ -888,7 +1081,6 @@ impl PacmanCart {
         self.respawn_until = 0;
         self.last_drawn_score = None;
         self.last_drawn_lives = None;
-        self.last_player_move = 0;
         self.announced_end = false;
 
         self.maze = generate_maze();
@@ -936,7 +1128,7 @@ impl PacmanCart {
                 mode: GhostMode::Normal,
                 home_corner: corner,
                 spawn: corner,
-                last_move: 0,
+                anim: None,
             })
             .collect();
 
@@ -1020,42 +1212,54 @@ impl Cart for PacmanCart {
 
         let t = api.time();
 
-        // Player move on cooldown while a direction key is held.
-        if t.saturating_sub(self.last_player_move) >= PLAYER_PERIOD {
-            // btn 0=left (-x), 1=right (+x), 2=down (+z), 3=up (-z).
-            let dir = if api.btn(3) {
-                Some((0, -1))
-            } else if api.btn(2) {
-                Some((0, 1))
-            } else if api.btn(0) {
-                Some((-1, 0))
-            } else if api.btn(1) {
-                Some((1, 0))
-            } else {
-                None
-            };
-            if let Some((dx, dz)) = dir {
-                if self.try_move_player(dx, dz, api) {
-                    self.last_player_move = t;
-                    self.check_end(t, api);
-                    if self.state != GameState::Playing { return; }
-                }
+        // Input → sticky desired_dir. The held direction is what the player
+        // wants; tile-boundary logic decides if and when to actually turn.
+        // btn 0=left, 1=right, 2=down (+z), 3=up (-z).
+        if api.btn(3) {
+            self.desired_dir = (0, -1);
+        } else if api.btn(2) {
+            self.desired_dir = (0, 1);
+        } else if api.btn(0) {
+            self.desired_dir = (-1, 0);
+        } else if api.btn(1) {
+            self.desired_dir = (1, 0);
+        }
+
+        // If the player is stopped at a tile, see if the held direction (or
+        // current heading) can start a fresh move.
+        if self.player_anim.is_none() {
+            let desired = self.desired_dir;
+            let current = self.player_dir;
+            if desired != (0, 0)
+                && self.can_move_to(self.player_tx, self.player_tz, desired)
+            {
+                self.start_player_move(desired);
+            } else if current != (0, 0)
+                && self.can_move_to(self.player_tx, self.player_tz, current)
+            {
+                self.start_player_move(current);
             }
         }
 
+        // Advance the player's animation by one frame.
+        self.tick_player_anim(t, api);
+        if self.state != GameState::Playing {
+            return;
+        }
+
         // Ghosts hold still during the intro grace period and after each respawn;
-        // otherwise each ghost ticks on its own period.
+        // once unlocked, each ghost runs its own animation independently.
         if t >= INTRO_GRACE && t >= self.respawn_until {
             for gi in 0..self.ghosts.len() {
-                let period = self.ghost_period(gi);
-                if t.saturating_sub(self.ghosts[gi].last_move) >= period {
-                    self.move_ghost(gi, api);
-                    self.ghosts[gi].last_move = t;
+                if self.ghosts[gi].anim.is_none() {
+                    if let Some(dir) = self.ghost_pick_dir(gi) {
+                        self.start_ghost_move(gi, dir);
+                    }
                 }
-            }
-            self.check_end(t, api);
-            if self.state != GameState::Playing {
-                return;
+                self.tick_ghost_anim(gi, t, api);
+                if self.state != GameState::Playing {
+                    return;
+                }
             }
         }
 
@@ -1067,9 +1271,8 @@ impl Cart for PacmanCart {
                 for gi in 0..self.ghosts.len() {
                     if self.ghosts[gi].mode == GhostMode::Frightened {
                         self.ghosts[gi].mode = GhostMode::Normal;
-                        let (gx, gz) =
-                            Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
-                        Self::clear_entity_box(gx, gz, api);
+                        let (gx, gy, gz) = self.ghost_anchor(gi);
+                        Self::clear_entity_box(gx, gy, gz, api);
                         self.render_ghost(gi, api);
                     }
                 }
