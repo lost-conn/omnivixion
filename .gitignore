@@ -1,0 +1,11 @@
+target/
+*.swp
+.DS_Store
+
+# playwright artifacts (any dir)
+.playwright-mcp/
+
+# web prototype
+web-prototype/node_modules/
+web-prototype/dist/
+web-prototype/.vite/
