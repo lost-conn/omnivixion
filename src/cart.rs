@@ -146,6 +146,7 @@ impl Cart for DemoCart {
 
 /// Build a 4³ sprite where each y-layer is filled with a single color.
 /// Returns the 16-byte nibble-packed data the emulator expects.
+#[allow(dead_code)]
 fn make_layered_sprite_4(layers: [u8; 4]) -> [u8; 16] {
     let size: u8 = 4;
     let mut data = [0u8; 16];
@@ -170,27 +171,34 @@ fn make_layered_sprite_4(layers: [u8; 4]) -> [u8; 16] {
     data
 }
 
+/// Build a 4³ sprite filled solid with a single color across all 32 even-parity
+/// cells. 16 bytes (32 nibbles), nibble-packed in the same layout as the
+/// display buffer's compact index.
+fn make_solid_sprite_4(color: u8) -> [u8; 16] {
+    let c = color & 0x0F;
+    let byte = c | (c << 4);
+    [byte; 16]
+}
+
 // ============================================================================
 //  PacmanCart — voxel pacman.
 // ============================================================================
 
 const MAZE_SIZE: i32 = 16;
-const STRIDE: i32 = 2;
-const MAZE_X0: i32 = 48;
-const MAZE_Z0: i32 = 48;
+const STRIDE: i32 = 4;
+const MAZE_X0: i32 = 32;
+const MAZE_Z0: i32 = 32;
 const GAME_Y: i32 = 2;
 
 const PLAYER_PERIOD: u64 = 8;   // frames between player moves while a key is held
 const GHOST_PERIOD:  u64 = 18;  // frames between ghost moves
 const INTRO_GRACE:   u64 = 60;  // ghosts hold still for 1 second after game start
 
-// Title text. Drawn on a horizontal plane just above the maze (XZFloor
-// orientation), so it reads naturally when the camera looks down.
-// Anchor is the bottom-left of the first glyph; with XZFloor "up" is -Z,
-// so glyph rows extend toward smaller Z (away from the player).
-const TITLE_X: i32 = 40;
+// Title text. Anchored just in front of the maze (smaller-Z side) on the
+// XZFloor plane so it reads from the default overhead camera.
+const TITLE_X: i32 = 16;
 const TITLE_Y: i32 = 4;
-const TITLE_Z: i32 = 46;
+const TITLE_Z: i32 = 30;
 const TITLE_MAX_CHARS: i32 = 16;
 
 const COLOR_FLOOR:  u8 = 4;   // grass — empty corridor
@@ -198,6 +206,12 @@ const COLOR_WALL:   u8 = 8;   // stone
 const COLOR_PELLET: u8 = 11;  // yellow
 const COLOR_PLAYER: u8 = 12;  // orange
 const COLOR_GHOST: [u8; 3] = [13, 14, 15]; // red, pink, purple
+
+// Sprite bank IDs used by the pacman cart.
+const SPR_WALL:   u8 = 0;
+const SPR_FLOOR:  u8 = 1;
+const SPR_PLAYER: u8 = 3;
+const SPR_GHOST_BASE: u8 = 4; // 4..6 used by the 3 current ghosts (phase A keeps the count)
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tile {
@@ -263,6 +277,26 @@ impl PacmanCart {
         }
     }
 
+    /// Stamp the static contents of a single maze tile (called both at world
+    /// init and whenever an entity vacates a tile).
+    fn stamp_tile(&self, tx: i32, tz: i32, api: &mut dyn CartApi) {
+        let (ax, az) = Self::tile_to_world(tx, tz);
+        match self.maze[tx as usize][tz as usize] {
+            Tile::Wall => api.spr_draw(SPR_WALL, ax, GAME_Y, az),
+            Tile::Pellet => {
+                api.spr_draw(SPR_FLOOR, ax, GAME_Y, az);
+                // Single yellow cell on top of the floor block as the pellet dot.
+                api.vox_set(ax, GAME_Y, az, COLOR_PELLET);
+            }
+            Tile::Empty => api.spr_draw(SPR_FLOOR, ax, GAME_Y, az),
+        }
+    }
+
+    /// Clear an entity sprite's 4³ bounding box at the given world anchor.
+    fn clear_entity_box(ax: i32, az: i32, api: &mut dyn CartApi) {
+        api.vox_fill(ax, GAME_Y, az, ax + 3, GAME_Y + 3, az + 3, 0);
+    }
+
     /// Clear the title bbox and stamp `s` (≤ TITLE_MAX_CHARS) on a horizontal
     /// plane above the maze using the XZFloor orientation.
     fn draw_title(api: &mut dyn CartApi, s: &str, color: u8) {
@@ -281,21 +315,20 @@ impl PacmanCart {
     fn render_static_world(&self, api: &mut dyn CartApi) {
         for tx in 0..MAZE_SIZE {
             for tz in 0..MAZE_SIZE {
-                let (x, z) = Self::tile_to_world(tx, tz);
-                api.vox_set(x, GAME_Y, z, self.tile_color(tx, tz));
+                self.stamp_tile(tx, tz, api);
             }
         }
     }
 
     fn render_player(&self, api: &mut dyn CartApi) {
         let (x, z) = Self::tile_to_world(self.player_tx, self.player_tz);
-        api.vox_set(x, GAME_Y, z, COLOR_PLAYER);
+        api.spr_draw(SPR_PLAYER, x, GAME_Y, z);
     }
 
     fn render_ghost(&self, gi: usize, api: &mut dyn CartApi) {
         let g = &self.ghosts[gi];
         let (x, z) = Self::tile_to_world(g.tx, g.tz);
-        api.vox_set(x, GAME_Y, z, g.color);
+        api.spr_draw(SPR_GHOST_BASE + gi as u8, x, GAME_Y, z);
     }
 
     fn try_move_player(&mut self, dx: i32, dz: i32, api: &mut dyn CartApi) -> bool {
@@ -308,9 +341,12 @@ impl PacmanCart {
         if new_tile == Tile::Wall {
             return false;
         }
-        // Repaint old tile from maze[][].
-        let (ox, oz) = Self::tile_to_world(self.player_tx, self.player_tz);
-        api.vox_set(ox, GAME_Y, oz, self.tile_color(self.player_tx, self.player_tz));
+        // Clear the old tile's 4³ box and re-stamp the underlying static tile.
+        let old_tx = self.player_tx;
+        let old_tz = self.player_tz;
+        let (ox, oz) = Self::tile_to_world(old_tx, old_tz);
+        Self::clear_entity_box(ox, oz, api);
+        self.stamp_tile(old_tx, old_tz, api);
 
         self.player_tx = new_tx;
         self.player_tz = new_tz;
@@ -321,8 +357,6 @@ impl PacmanCart {
             self.score += 10;
         }
 
-        // Re-render player on top. Repaint any ghost we may have stepped onto in the
-        // same frame so it stays visible after our own paint clears it next tick.
         self.render_player(api);
         true
     }
@@ -369,9 +403,10 @@ impl PacmanCart {
         }
         let Some((_, (dx, dz))) = best else { return };
 
-        // Repaint old tile from underlying state.
+        // Clear the ghost's old 4³ box and re-stamp the underlying tile.
         let (ox, oz) = Self::tile_to_world(g_tx, g_tz);
-        api.vox_set(ox, GAME_Y, oz, self.tile_color(g_tx, g_tz));
+        Self::clear_entity_box(ox, oz, api);
+        self.stamp_tile(g_tx, g_tz, api);
 
         let g = &mut self.ghosts[gi];
         g.tx += dx;
@@ -402,17 +437,21 @@ impl PacmanCart {
     }
 
     fn flood_end_state(&mut self, api: &mut dyn CartApi) {
-        // Recolor all tiles to match final state.
+        // Recolor all non-wall tiles to a single fill color. Walls keep their
+        // structure; floor blocks become the flood color via vox_fill so the
+        // whole 4³ block recolors uniformly.
         let fill = match self.state {
-            GameState::Won => COLOR_PELLET,        // pellet-yellow celebration
-            GameState::Lost => 13,                 // red
+            GameState::Won => COLOR_PELLET, // pellet-yellow celebration
+            GameState::Lost => 13,          // red
             GameState::Playing => return,
         };
         for tx in 0..MAZE_SIZE {
             for tz in 0..MAZE_SIZE {
-                if self.maze[tx as usize][tz as usize] == Tile::Wall { continue; }
+                if self.maze[tx as usize][tz as usize] == Tile::Wall {
+                    continue;
+                }
                 let (x, z) = Self::tile_to_world(tx, tz);
-                api.vox_set(x, GAME_Y, z, fill);
+                api.vox_fill(x, GAME_Y, z, x + 3, GAME_Y + 3, z + 3, fill);
             }
         }
         // Always keep player visible on top.
@@ -467,6 +506,15 @@ impl Cart for PacmanCart {
         api.print("--- omnivixion: pacman v0 ---");
         api.print("WASD to move. Eat all pellets. Avoid the ghosts.");
         api.cam_pitch(75.0);
+
+        // Static sprites: wall + floor blocks.
+        let _ = api.spr_load(SPR_WALL,  4, &make_solid_sprite_4(COLOR_WALL));
+        let _ = api.spr_load(SPR_FLOOR, 4, &make_solid_sprite_4(COLOR_FLOOR));
+        // Entity sprites.
+        let _ = api.spr_load(SPR_PLAYER, 4, &make_solid_sprite_4(COLOR_PLAYER));
+        for (i, &c) in COLOR_GHOST.iter().enumerate() {
+            let _ = api.spr_load(SPR_GHOST_BASE + i as u8, 4, &make_solid_sprite_4(c));
+        }
 
         self.maze = generate_maze();
         let n = MAZE_SIZE;
