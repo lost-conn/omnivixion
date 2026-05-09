@@ -864,29 +864,39 @@ fn generate_maze() -> Vec<Vec<Tile>> {
     m
 }
 
-impl Cart for PacmanCart {
-    fn init(&mut self, api: &mut dyn CartApi) {
-        api.print("--- omnivixion: pacman v0 ---");
-        api.print("WASD to move. Eat all pellets. Avoid the ghosts.");
-        api.cam_pitch(75.0);
-
-        // Static maze sprites.
+impl PacmanCart {
+    /// One-time sprite registration. Called from `init`. Sprites persist in the
+    /// emulator across cart-driven restarts so we don't need to re-load.
+    fn load_sprites(api: &mut dyn CartApi) {
         let _ = api.spr_load(SPR_WALL,  4, &make_solid_sprite_4(COLOR_WALL));
         let _ = api.spr_load(SPR_FLOOR, 4, &make_solid_sprite_4(COLOR_FLOOR));
         let _ = api.spr_load(SPR_POWER, 2, &make_solid_sprite_2(COLOR_POWER));
-        // Entity sprites — player + one per ghost behavior + frightened/eaten variants.
         let _ = api.spr_load(SPR_PLAYER, 4, &make_solid_sprite_4(COLOR_PLAYER));
         for (i, &c) in COLOR_GHOST.iter().enumerate() {
             let _ = api.spr_load(SPR_GHOST_BASE + i as u8, 4, &make_solid_sprite_4(c));
         }
         let _ = api.spr_load(SPR_FRIGHT, 4, &make_solid_sprite_4(COLOR_FRIGHT));
         let _ = api.spr_load(SPR_EATEN,  4, &make_solid_sprite_4(COLOR_EATEN));
+    }
 
-        // Start in the first scatter phase.
+    /// Reset all gameplay state and re-render the world. Used both on first
+    /// init and on restart-after-game-over.
+    fn setup_world(&mut self, api: &mut dyn CartApi) {
+        self.score = 0;
+        self.lives = LIVES_START;
+        self.player_dir = (0, -1);
+        self.state = GameState::Playing;
         self.phase_index = 0;
         let (phase, duration) = PHASE_SCHEDULE[0];
         self.phase = phase;
         self.phase_timer = duration;
+        self.frightened_timer = 0;
+        self.ghost_chain = 0;
+        self.respawn_until = 0;
+        self.last_drawn_score = None;
+        self.last_drawn_lives = None;
+        self.last_player_move = 0;
+        self.announced_end = false;
 
         self.maze = generate_maze();
         let n = MAZE_SIZE;
@@ -952,6 +962,39 @@ impl Cart for PacmanCart {
         api.print(&format!("Pellets: {}", self.pellets_remaining));
     }
 
+    /// Wipe the display buffer and re-run setup_world. Called when the player
+    /// presses Z on the game-over screen.
+    fn restart_game(&mut self, api: &mut dyn CartApi) {
+        api.vox_clear();
+        self.setup_world(api);
+    }
+
+    /// Stamp the "PRESS Z" hint just under the end-state title, on the same
+    /// XZFloor plane.
+    fn draw_restart_prompt(api: &mut dyn CartApi) {
+        let advance = api.text_advance() as i32;
+        let height = api.text_height() as i32;
+        let s = "PRESS Z";
+        let max_w = (s.len() as i32) * advance;
+        let z = TITLE_Z + 12;
+        api.vox_fill(
+            TITLE_X, TITLE_Y, z - height,
+            TITLE_X + max_w, TITLE_Y + 1, z + 1,
+            0,
+        );
+        api.text_draw_axis(s, TITLE_X, TITLE_Y, z, COLOR_PELLET, TextOrient::XZFloor);
+    }
+}
+
+impl Cart for PacmanCart {
+    fn init(&mut self, api: &mut dyn CartApi) {
+        api.print("--- omnivixion: pacman v0 ---");
+        api.print("WASD to move. Eat all pellets. Avoid the ghosts.");
+        api.cam_pitch(75.0);
+        Self::load_sprites(api);
+        self.setup_world(api);
+    }
+
     fn update(&mut self, api: &mut dyn CartApi, _dt: f32) {
         if self.state != GameState::Playing {
             if !self.announced_end {
@@ -969,6 +1012,15 @@ impl Cart for PacmanCart {
                     GameState::Playing => {}
                 }
                 self.flood_end_state(api);
+                Self::draw_restart_prompt(api);
+                // The HUD may still show pre-collision values (e.g. LIVES 1
+                // when state flipped to Lost on the same tick); flush it.
+                self.redraw_hud_if_dirty(api);
+            }
+            // Wait for the restart input — Z (action A) wipes everything and
+            // calls setup_world for a fresh run.
+            if api.btnp(6) {
+                self.restart_game(api);
             }
             return;
         }
