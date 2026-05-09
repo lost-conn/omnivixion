@@ -1,5 +1,6 @@
 mod cart;
 mod console;
+mod font;
 mod lattice;
 mod render;
 

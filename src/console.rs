@@ -208,6 +208,16 @@ pub trait CartApi {
     /// Drop a sprite from the bank. After this, `spr_draw(id, ...)` is a no-op.
     fn spr_clear(&mut self, id: u8);
 
+    /// Stamp a string of glyphs into the display buffer in the X+ direction.
+    /// Anchor `(x, y, z)` is the bottom-left voxel of the first glyph.
+    /// Color must be in 1..=15. Each glyph is 5×7×1; cells z-snap by ±1 to
+    /// satisfy lattice parity, so text is 1-2 cells thick along z.
+    fn text_draw(&mut self, s: &str, x: i32, y: i32, z: i32, color: u8);
+    /// X-advance per character including the 1-cell gap between glyphs.
+    fn text_advance(&self) -> u8;
+    /// Glyph height in y cells.
+    fn text_height(&self) -> u8;
+
     fn pal_set(&mut self, slot: u8, r: f32, g: f32, b: f32);
     fn pal_reset(&mut self);
     fn cam_pitch(&mut self, deg: f32);
@@ -359,6 +369,46 @@ impl CartApi for Console {
 
     fn spr_clear(&mut self, id: u8) {
         self.sprites[id as usize] = None;
+    }
+
+    fn text_draw(&mut self, s: &str, x: i32, y: i32, z: i32, color: u8) {
+        if !(1..=15).contains(&color) {
+            return;
+        }
+        let mut cx = x;
+        for c in s.chars() {
+            let g = crate::font::glyph(c);
+            let h = crate::font::FONT_HEIGHT as i32;
+            let w = crate::font::FONT_WIDTH as i32;
+            for ry in 0..h {
+                let row = g[ry as usize];
+                for rx in 0..w {
+                    // Bit (w - 1 - rx) of the row mask = pixel at column rx.
+                    let on = (row >> (w - 1 - rx)) & 1 == 1;
+                    if !on {
+                        continue;
+                    }
+                    let wx = cx + rx;
+                    // Row 0 of the glyph is the top; flip to put it at higher y.
+                    let wy = y + (h - 1 - ry);
+                    // Pick the z that is parity-valid for this voxel.
+                    let mut wz = z;
+                    if !is_valid(wx, wy, wz) {
+                        wz = z + 1;
+                    }
+                    self.vox_set(wx, wy, wz, color);
+                }
+            }
+            cx += crate::font::FONT_ADVANCE as i32;
+        }
+    }
+
+    fn text_advance(&self) -> u8 {
+        crate::font::FONT_ADVANCE
+    }
+
+    fn text_height(&self) -> u8 {
+        crate::font::FONT_HEIGHT
     }
 
     fn pal_set(&mut self, slot: u8, r: f32, g: f32, b: f32) {

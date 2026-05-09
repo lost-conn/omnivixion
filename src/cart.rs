@@ -184,6 +184,12 @@ const PLAYER_PERIOD: u64 = 8;   // frames between player moves while a key is he
 const GHOST_PERIOD:  u64 = 18;  // frames between ghost moves
 const INTRO_GRACE:   u64 = 60;  // ghosts hold still for 1 second after game start
 
+// Title text anchor (just in front of the maze, floating above it).
+const TITLE_X: i32 = 48;
+const TITLE_Y: i32 = 10;
+const TITLE_Z: i32 = 46;
+const TITLE_MAX_CHARS: i32 = 6;
+
 const COLOR_FLOOR:  u8 = 4;   // grass — empty corridor
 const COLOR_WALL:   u8 = 8;   // stone
 const COLOR_PELLET: u8 = 11;  // yellow
@@ -252,6 +258,19 @@ impl PacmanCart {
             Tile::Pellet => COLOR_PELLET,
             Tile::Empty => COLOR_FLOOR,
         }
+    }
+
+    /// Clear the title bbox and stamp `s` (≤ TITLE_MAX_CHARS) at the title anchor.
+    fn draw_title(api: &mut dyn CartApi, s: &str, color: u8) {
+        let advance = api.text_advance() as i32;
+        let height = api.text_height() as i32;
+        let max_w = TITLE_MAX_CHARS * advance;
+        api.vox_fill(
+            TITLE_X, TITLE_Y, TITLE_Z,
+            TITLE_X + max_w, TITLE_Y + height, TITLE_Z + 1,
+            0,
+        );
+        api.text_draw(s, TITLE_X, TITLE_Y, TITLE_Z, color);
     }
 
     fn render_static_world(&self, api: &mut dyn CartApi) {
@@ -473,15 +492,8 @@ impl Cart for PacmanCart {
             self.render_ghost(gi, api);
         }
 
-        // Sprite test: a 4-layer totem (yellow, orange, red, purple) anchored above
-        // the central spawn point. Validates spr_load + spr_draw on the new API.
-        let totem = make_layered_sprite_4([11, 12, 13, 15]);
-        if api.spr_load(0, 4, &totem) {
-            let (cx, cz) = Self::tile_to_world(MAZE_SIZE / 2, MAZE_SIZE / 2);
-            api.spr_draw(0, cx, GAME_Y + 4, cz);
-        } else {
-            api.print("spr_load failed");
-        }
+        // Title text floating above the maze.
+        Self::draw_title(api, "PACMAN", COLOR_PELLET);
 
         api.print(&format!("Pellets: {}", self.pellets_remaining));
     }
@@ -492,14 +504,14 @@ impl Cart for PacmanCart {
                 self.announced_end = true;
                 let final_score = self.score;
                 match self.state {
-                    GameState::Won => api.print(&format!(
-                        "YOU WIN! Final score: {}",
-                        final_score
-                    )),
-                    GameState::Lost => api.print(&format!(
-                        "Caught! Final score: {}",
-                        final_score
-                    )),
+                    GameState::Won => {
+                        api.print(&format!("YOU WIN! Final score: {}", final_score));
+                        Self::draw_title(api, "WIN!", COLOR_PELLET);
+                    }
+                    GameState::Lost => {
+                        api.print(&format!("Caught! Final score: {}", final_score));
+                        Self::draw_title(api, "LOST", 13);
+                    }
                     GameState::Playing => {}
                 }
                 self.flood_end_state(api);
