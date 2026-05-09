@@ -222,7 +222,6 @@ const HUD_MAX_CHARS: i32 = 5;
 const LIVES_START: u8 = 3;
 const RESPAWN_GRACE: u64 = 60;
 
-const COLOR_FLOOR:  u8 = 4;   // grass — empty corridor
 const COLOR_WALL:   u8 = 8;   // stone
 const COLOR_PELLET: u8 = 10;  // snow/white — small dots on the floor
 const COLOR_PLAYER: u8 = 11;  // yellow — classic pacman
@@ -234,8 +233,7 @@ const COLOR_GHOST: [u8; 4] = [13, 14, 2, 12];
 
 // Sprite bank IDs used by the pacman cart.
 const SPR_WALL:       u8 = 0;
-const SPR_FLOOR:      u8 = 1;
-const SPR_POWER:      u8 = 2;  // 2³ pink blob in the corner of the floor tile
+const SPR_POWER:      u8 = 2;  // 2³ pink blob; ID 1 left free for future floor
 const SPR_PLAYER:     u8 = 3;
 const SPR_GHOST_BASE: u8 = 4;  // 4..7 — one per ghost behavior
 const SPR_FRIGHT:     u8 = 8;  // Frightened ghost (deep blue)
@@ -364,32 +362,17 @@ impl PacmanCart {
         (MAZE_X0 + STRIDE * tx, MAZE_Z0 + STRIDE * tz)
     }
 
-    fn tile_color(&self, tx: i32, tz: i32) -> u8 {
-        match self.maze[tx as usize][tz as usize] {
-            Tile::Wall => COLOR_WALL,
-            Tile::Pellet => COLOR_PELLET,
-            Tile::PowerPellet => COLOR_POWER,
-            Tile::Empty => COLOR_FLOOR,
-        }
-    }
-
     /// Stamp the static contents of a single maze tile (called both at world
-    /// init and whenever an entity vacates a tile).
+    /// init and whenever an entity vacates a tile). Corridors are intentionally
+    /// empty (dark gaps) so pellets and power pellets read clearly against the
+    /// background instead of fighting a 4³ floor block for the eye's attention.
     fn stamp_tile(&self, tx: i32, tz: i32, api: &mut dyn CartApi) {
         let (ax, az) = Self::tile_to_world(tx, tz);
         match self.maze[tx as usize][tz as usize] {
             Tile::Wall => api.spr_draw(SPR_WALL, ax, GAME_Y, az),
-            Tile::Pellet => {
-                api.spr_draw(SPR_FLOOR, ax, GAME_Y, az);
-                // Single white cell on top of the floor block as the pellet dot.
-                api.vox_set(ax, GAME_Y, az, COLOR_PELLET);
-            }
-            Tile::PowerPellet => {
-                api.spr_draw(SPR_FLOOR, ax, GAME_Y, az);
-                // 2³ pink blob in one corner of the floor — bigger than a pellet.
-                api.spr_draw(SPR_POWER, ax, GAME_Y, az);
-            }
-            Tile::Empty => api.spr_draw(SPR_FLOOR, ax, GAME_Y, az),
+            Tile::Pellet => api.vox_set(ax, GAME_Y, az, COLOR_PELLET),
+            Tile::PowerPellet => api.spr_draw(SPR_POWER, ax, GAME_Y, az),
+            Tile::Empty => {} // empty corridor — no cells
         }
     }
 
@@ -869,7 +852,6 @@ impl PacmanCart {
     /// emulator across cart-driven restarts so we don't need to re-load.
     fn load_sprites(api: &mut dyn CartApi) {
         let _ = api.spr_load(SPR_WALL,  4, &make_solid_sprite_4(COLOR_WALL));
-        let _ = api.spr_load(SPR_FLOOR, 4, &make_solid_sprite_4(COLOR_FLOOR));
         let _ = api.spr_load(SPR_POWER, 2, &make_solid_sprite_2(COLOR_POWER));
         let _ = api.spr_load(SPR_PLAYER, 4, &make_solid_sprite_4(COLOR_PLAYER));
         for (i, &c) in COLOR_GHOST.iter().enumerate() {
