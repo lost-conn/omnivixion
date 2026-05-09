@@ -366,12 +366,23 @@ impl PacmanCart {
     /// init and whenever an entity vacates a tile). Corridors are intentionally
     /// empty (dark gaps) so pellets and power pellets read clearly against the
     /// background instead of fighting a 4³ floor block for the eye's attention.
+    ///
+    /// Pellets sit at the geometric center of the 4³ tile region rather than
+    /// at the anchor corner, so they line up with the centers of walls and
+    /// entities (which are anchored at the same corner but fill the full tile).
     fn stamp_tile(&self, tx: i32, tz: i32, api: &mut dyn CartApi) {
         let (ax, az) = Self::tile_to_world(tx, tz);
         match self.maze[tx as usize][tz as usize] {
             Tile::Wall => api.spr_draw(SPR_WALL, ax, GAME_Y, az),
-            Tile::Pellet => api.vox_set(ax, GAME_Y, az, COLOR_PELLET),
-            Tile::PowerPellet => api.spr_draw(SPR_POWER, ax, GAME_Y, az),
+            Tile::Pellet => {
+                // Single cell at the visual center of the 4³ tile region.
+                api.vox_set(ax + 2, GAME_Y + 2, az + 2, COLOR_PELLET);
+            }
+            Tile::PowerPellet => {
+                // 2³ sprite shifted +1 in x and z so its 2-cell span straddles
+                // the tile's xz center instead of clinging to a corner.
+                api.spr_draw(SPR_POWER, ax + 1, GAME_Y, az + 1);
+            }
             Tile::Empty => {} // empty corridor — no cells
         }
     }
