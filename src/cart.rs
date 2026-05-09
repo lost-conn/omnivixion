@@ -1,6 +1,6 @@
 //! Cart trait + the in-tree carts (DemoCart for the showcase scene, PacmanCart for the game).
 
-use crate::console::CartApi;
+use crate::console::{CartApi, TextOrient};
 
 pub trait Cart {
     fn init(&mut self, api: &mut dyn CartApi);
@@ -184,9 +184,12 @@ const PLAYER_PERIOD: u64 = 8;   // frames between player moves while a key is he
 const GHOST_PERIOD:  u64 = 18;  // frames between ghost moves
 const INTRO_GRACE:   u64 = 60;  // ghosts hold still for 1 second after game start
 
-// Title text anchor (just in front of the maze, floating above it).
+// Title text. Drawn on a horizontal plane just above the maze (XZFloor
+// orientation), so it reads naturally when the camera looks down.
+// Anchor is the bottom-left of the first glyph; with XZFloor "up" is -Z,
+// so glyph rows extend toward smaller Z (away from the player).
 const TITLE_X: i32 = 40;
-const TITLE_Y: i32 = 10;
+const TITLE_Y: i32 = 4;
 const TITLE_Z: i32 = 46;
 const TITLE_MAX_CHARS: i32 = 16;
 
@@ -260,17 +263,19 @@ impl PacmanCart {
         }
     }
 
-    /// Clear the title bbox and stamp `s` (≤ TITLE_MAX_CHARS) at the title anchor.
+    /// Clear the title bbox and stamp `s` (≤ TITLE_MAX_CHARS) on a horizontal
+    /// plane above the maze using the XZFloor orientation.
     fn draw_title(api: &mut dyn CartApi, s: &str, color: u8) {
         let advance = api.text_advance() as i32;
         let height = api.text_height() as i32;
         let max_w = TITLE_MAX_CHARS * advance;
+        // XZFloor: text extends +X for advance, -Z for glyph height. Snap on Y.
         api.vox_fill(
-            TITLE_X, TITLE_Y, TITLE_Z,
-            TITLE_X + max_w, TITLE_Y + height, TITLE_Z + 1,
+            TITLE_X, TITLE_Y, TITLE_Z - height,
+            TITLE_X + max_w, TITLE_Y + 1, TITLE_Z + 1,
             0,
         );
-        api.text_draw(s, TITLE_X, TITLE_Y, TITLE_Z, color);
+        api.text_draw_axis(s, TITLE_X, TITLE_Y, TITLE_Z, color, TextOrient::XZFloor);
     }
 
     fn render_static_world(&self, api: &mut dyn CartApi) {
