@@ -185,10 +185,10 @@ const GHOST_PERIOD:  u64 = 18;  // frames between ghost moves
 const INTRO_GRACE:   u64 = 60;  // ghosts hold still for 1 second after game start
 
 // Title text anchor (just in front of the maze, floating above it).
-const TITLE_X: i32 = 48;
+const TITLE_X: i32 = 40;
 const TITLE_Y: i32 = 10;
 const TITLE_Z: i32 = 46;
-const TITLE_MAX_CHARS: i32 = 6;
+const TITLE_MAX_CHARS: i32 = 16;
 
 const COLOR_FLOOR:  u8 = 4;   // grass — empty corridor
 const COLOR_WALL:   u8 = 8;   // stone
@@ -492,8 +492,9 @@ impl Cart for PacmanCart {
             self.render_ghost(gi, api);
         }
 
-        // Title text floating above the maze.
-        Self::draw_title(api, "PACMAN", COLOR_PELLET);
+        // Title text floating above the maze. Exercises mixed case + digits +
+        // punctuation through the renderer.
+        Self::draw_title(api, "Pacman v0.1!", COLOR_PELLET);
 
         api.print(&format!("Pellets: {}", self.pellets_remaining));
     }
