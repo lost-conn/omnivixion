@@ -180,6 +180,13 @@ fn make_solid_sprite_4(color: u8) -> [u8; 16] {
     [byte; 16]
 }
 
+/// Build a 2³ sprite filled solid with a single color (4 even-parity cells, 2 bytes).
+fn make_solid_sprite_2(color: u8) -> [u8; 2] {
+    let c = color & 0x0F;
+    let byte = c | (c << 4);
+    [byte; 2]
+}
+
 // ============================================================================
 //  PacmanCart — voxel pacman.
 // ============================================================================
@@ -190,9 +197,12 @@ const MAZE_X0: i32 = 32;
 const MAZE_Z0: i32 = 32;
 const GAME_Y: i32 = 2;
 
-const PLAYER_PERIOD: u64 = 8;   // frames between player moves while a key is held
-const GHOST_PERIOD:  u64 = 18;  // frames between ghost moves
-const INTRO_GRACE:   u64 = 60;  // ghosts hold still for 1 second after game start
+const PLAYER_PERIOD:    u64 = 8;   // frames between player moves while a key is held
+const GHOST_PERIOD:     u64 = 18;  // Normal-mode ghost move period
+const FRIGHT_PERIOD:    u64 = 28;  // Frightened-mode is slower
+const EATEN_PERIOD:     u64 = 8;   // Eaten ghosts return to spawn fast
+const INTRO_GRACE:      u64 = 60;  // ghosts hold still for 1 second after game start
+const FRIGHT_DURATION:  u64 = 360; // 6s of Frightened mode after a power pellet
 
 // Title text. Anchored just in front of the maze (smaller-Z side) on the
 // XZFloor plane so it reads from the default overhead camera.
@@ -205,14 +215,20 @@ const COLOR_FLOOR:  u8 = 4;   // grass — empty corridor
 const COLOR_WALL:   u8 = 8;   // stone
 const COLOR_PELLET: u8 = 10;  // snow/white — small dots on the floor
 const COLOR_PLAYER: u8 = 11;  // yellow — classic pacman
+const COLOR_POWER:  u8 = 14;  // pink — power pellet
+const COLOR_FRIGHT: u8 = 1;   // deep blue — Frightened ghost
+const COLOR_EATEN:  u8 = 10;  // snow — Eaten ghost (just the eyes, conceptually)
 // Ghost colors keyed to GhostBehavior order: Blinky red, Pinky pink, Inky blue, Clyde orange.
 const COLOR_GHOST: [u8; 4] = [13, 14, 2, 12];
 
 // Sprite bank IDs used by the pacman cart.
-const SPR_WALL:   u8 = 0;
-const SPR_FLOOR:  u8 = 1;
-const SPR_PLAYER: u8 = 3;
-const SPR_GHOST_BASE: u8 = 4; // 4..7 — one per ghost behavior
+const SPR_WALL:       u8 = 0;
+const SPR_FLOOR:      u8 = 1;
+const SPR_POWER:      u8 = 2;  // 2³ pink blob in the corner of the floor tile
+const SPR_PLAYER:     u8 = 3;
+const SPR_GHOST_BASE: u8 = 4;  // 4..7 — one per ghost behavior
+const SPR_FRIGHT:     u8 = 8;  // Frightened ghost (deep blue)
+const SPR_EATEN:      u8 = 9;  // Eaten ghost (snow/white)
 
 // Classic pacman scatter/chase schedule. Frame counts are 60 Hz.
 const PHASE_SCHEDULE: &[(GamePhase, u64)] = &[
@@ -230,6 +246,7 @@ const PHASE_SCHEDULE: &[(GamePhase, u64)] = &[
 enum Tile {
     Wall,
     Pellet,
+    PowerPellet,
     Empty,
 }
 
@@ -271,6 +288,9 @@ struct Ghost {
     mode: GhostMode,
     home_corner: (i32, i32),
     spawn: (i32, i32),
+    /// Global tick at which this ghost last moved. Per-ghost so Eaten and
+    /// Frightened can tick at different cadences.
+    last_move: u64,
 }
 
 pub struct PacmanCart {
@@ -288,15 +308,12 @@ pub struct PacmanCart {
     phase: GamePhase,
     phase_timer: u64,
     phase_index: usize,
-    /// Phase C: counts down while ghosts are Frightened. Pauses phase_timer.
-    #[allow(dead_code)]
+    /// Counts down while any ghosts are Frightened. Pauses phase_timer.
     frightened_timer: u64,
-    /// Phase C: consecutive ghosts eaten in current Frightened spell.
-    #[allow(dead_code)]
+    /// Consecutive ghosts eaten in current Frightened spell.
     ghost_chain: u8,
     rng: u64,
     last_player_move: u64,
-    last_ghost_move: u64,
     announced_end: bool,
 }
 
@@ -318,7 +335,6 @@ impl PacmanCart {
             ghost_chain: 0,
             rng: 0xDEAD_BEEF_CAFE_BABE,
             last_player_move: 0,
-            last_ghost_move: 0,
             announced_end: false,
         }
     }
@@ -331,6 +347,7 @@ impl PacmanCart {
         match self.maze[tx as usize][tz as usize] {
             Tile::Wall => COLOR_WALL,
             Tile::Pellet => COLOR_PELLET,
+            Tile::PowerPellet => COLOR_POWER,
             Tile::Empty => COLOR_FLOOR,
         }
     }
@@ -343,8 +360,13 @@ impl PacmanCart {
             Tile::Wall => api.spr_draw(SPR_WALL, ax, GAME_Y, az),
             Tile::Pellet => {
                 api.spr_draw(SPR_FLOOR, ax, GAME_Y, az);
-                // Single yellow cell on top of the floor block as the pellet dot.
+                // Single white cell on top of the floor block as the pellet dot.
                 api.vox_set(ax, GAME_Y, az, COLOR_PELLET);
+            }
+            Tile::PowerPellet => {
+                api.spr_draw(SPR_FLOOR, ax, GAME_Y, az);
+                // 2³ pink blob in one corner of the floor — bigger than a pellet.
+                api.spr_draw(SPR_POWER, ax, GAME_Y, az);
             }
             Tile::Empty => api.spr_draw(SPR_FLOOR, ax, GAME_Y, az),
         }
@@ -386,7 +408,22 @@ impl PacmanCart {
     fn render_ghost(&self, gi: usize, api: &mut dyn CartApi) {
         let g = &self.ghosts[gi];
         let (x, z) = Self::tile_to_world(g.tx, g.tz);
-        api.spr_draw(SPR_GHOST_BASE + gi as u8, x, GAME_Y, z);
+        let sprite_id = match g.mode {
+            GhostMode::Normal => SPR_GHOST_BASE + gi as u8,
+            GhostMode::Frightened => SPR_FRIGHT,
+            GhostMode::Eaten => SPR_EATEN,
+        };
+        api.spr_draw(sprite_id, x, GAME_Y, z);
+    }
+
+    /// Per-ghost move period — Normal is the baseline, Frightened slower,
+    /// Eaten faster (beelining for spawn).
+    fn ghost_period(&self, gi: usize) -> u64 {
+        match self.ghosts[gi].mode {
+            GhostMode::Normal => GHOST_PERIOD,
+            GhostMode::Frightened => FRIGHT_PERIOD,
+            GhostMode::Eaten => EATEN_PERIOD,
+        }
     }
 
     fn try_move_player(&mut self, dx: i32, dz: i32, api: &mut dyn CartApi) -> bool {
@@ -409,16 +446,43 @@ impl PacmanCart {
         self.player_tx = new_tx;
         self.player_tz = new_tz;
 
-        if new_tile == Tile::Pellet {
-            self.maze[new_tx as usize][new_tz as usize] = Tile::Empty;
-            self.pellets_remaining -= 1;
-            self.score += 10;
+        match new_tile {
+            Tile::Pellet => {
+                self.maze[new_tx as usize][new_tz as usize] = Tile::Empty;
+                self.pellets_remaining -= 1;
+                self.score += 10;
+            }
+            Tile::PowerPellet => {
+                self.maze[new_tx as usize][new_tz as usize] = Tile::Empty;
+                self.pellets_remaining -= 1;
+                self.score += 50;
+                self.trigger_frightened(api);
+            }
+            _ => {}
         }
 
         self.player_dir = (dx, dz);
 
         self.render_player(api);
         true
+    }
+
+    /// Flip every Normal-mode ghost into Frightened, restart the chain counter,
+    /// and pause the scatter/chase clock for FRIGHT_DURATION frames.
+    fn trigger_frightened(&mut self, api: &mut dyn CartApi) {
+        self.frightened_timer = FRIGHT_DURATION;
+        self.ghost_chain = 0;
+        for gi in 0..self.ghosts.len() {
+            if self.ghosts[gi].mode == GhostMode::Normal {
+                self.ghosts[gi].mode = GhostMode::Frightened;
+                // Reverse direction (classic) and re-render with the blue sprite.
+                let (dx, dz) = self.ghosts[gi].last_dir;
+                self.ghosts[gi].last_dir = (-dx, -dz);
+                let (gx, gz) = Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
+                Self::clear_entity_box(gx, gz, api);
+                self.render_ghost(gi, api);
+            }
+        }
     }
 
     /// Compute the target tile for ghost `gi` given the current phase, player
@@ -457,18 +521,19 @@ impl PacmanCart {
         }
     }
 
-    fn move_ghost(&mut self, gi: usize, api: &mut dyn CartApi) {
-        let target = self.target_for_ghost(gi);
+    /// Pick the neighbor tile that minimizes squared distance to `target`,
+    /// using canonical up>left>down>right tiebreak. First pass forbids the
+    /// reverse direction; if no valid choice, second pass allows it (cornered).
+    fn pick_best_toward(&self, gi: usize, target: (i32, i32)) -> Option<(i32, i32)> {
         let g_tx = self.ghosts[gi].tx;
         let g_tz = self.ghosts[gi].tz;
         let last_dir = self.ghosts[gi].last_dir;
         let avoid = (-last_dir.0, -last_dir.1);
-        // Canonical pacman tiebreak order: up > left > down > right.
         let dirs = [(0, -1), (-1, 0), (0, 1), (1, 0)];
 
-        let pick_best = |dirs_iter: &[(i32, i32)], allow_reverse: bool| -> Option<(i32, i32)> {
+        let try_pick = |allow_reverse: bool| -> Option<(i32, i32)> {
             let mut best: Option<(i32, (i32, i32))> = None;
-            for &(dx, dz) in dirs_iter {
+            for &(dx, dz) in &dirs {
                 let nx = g_tx + dx;
                 let nz = g_tz + dz;
                 if !in_bounds(nx, nz) {
@@ -480,7 +545,6 @@ impl PacmanCart {
                 if !allow_reverse && (dx, dz) == avoid {
                     continue;
                 }
-                // Squared Euclidean distance — matches classic pacman.
                 let dx_t = nx - target.0;
                 let dz_t = nz - target.1;
                 let dist = dx_t * dx_t + dz_t * dz_t;
@@ -491,10 +555,70 @@ impl PacmanCart {
             best.map(|(_, d)| d)
         };
 
-        let chosen = pick_best(&dirs, false).or_else(|| pick_best(&dirs, true));
+        try_pick(false).or_else(|| try_pick(true))
+    }
+
+    /// Frightened movement: pick a uniformly random valid neighbor.
+    fn pick_random_neighbor(&mut self, gi: usize) -> Option<(i32, i32)> {
+        let g_tx = self.ghosts[gi].tx;
+        let g_tz = self.ghosts[gi].tz;
+        let last_dir = self.ghosts[gi].last_dir;
+        let avoid = (-last_dir.0, -last_dir.1);
+        let dirs = [(0, -1), (-1, 0), (0, 1), (1, 0)];
+
+        let mut valid = [(0i32, 0i32); 4];
+        let mut count = 0usize;
+        for &(dx, dz) in &dirs {
+            let nx = g_tx + dx;
+            let nz = g_tz + dz;
+            if !in_bounds(nx, nz) {
+                continue;
+            }
+            if self.maze[nx as usize][nz as usize] == Tile::Wall {
+                continue;
+            }
+            if (dx, dz) == avoid {
+                continue;
+            }
+            valid[count] = (dx, dz);
+            count += 1;
+        }
+        if count == 0 {
+            // Cornered — allow reverse.
+            for &(dx, dz) in &dirs {
+                let nx = g_tx + dx;
+                let nz = g_tz + dz;
+                if !in_bounds(nx, nz) {
+                    continue;
+                }
+                if self.maze[nx as usize][nz as usize] == Tile::Wall {
+                    continue;
+                }
+                valid[count] = (dx, dz);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        let idx = (self.rng_step() as usize) % count;
+        Some(valid[idx])
+    }
+
+    fn move_ghost(&mut self, gi: usize, api: &mut dyn CartApi) {
+        let mode = self.ghosts[gi].mode;
+        let chosen = match mode {
+            GhostMode::Normal => self.pick_best_toward(gi, self.target_for_ghost(gi)),
+            GhostMode::Eaten => {
+                let spawn = self.ghosts[gi].spawn;
+                self.pick_best_toward(gi, spawn)
+            }
+            GhostMode::Frightened => self.pick_random_neighbor(gi),
+        };
         let Some((dx, dz)) = chosen else { return };
 
-        // Clear the ghost's old 4³ box and re-stamp the underlying tile.
+        let g_tx = self.ghosts[gi].tx;
+        let g_tz = self.ghosts[gi].tz;
         let (ox, oz) = Self::tile_to_world(g_tx, g_tz);
         Self::clear_entity_box(ox, oz, api);
         self.stamp_tile(g_tx, g_tz, api);
@@ -505,6 +629,18 @@ impl PacmanCart {
         g.last_dir = (dx, dz);
 
         self.render_ghost(gi, api);
+
+        // Eaten → reached spawn? Flip back to Normal and re-render with the
+        // normal-color sprite right away.
+        if mode == GhostMode::Eaten {
+            let g = &self.ghosts[gi];
+            if (g.tx, g.tz) == g.spawn {
+                self.ghosts[gi].mode = GhostMode::Normal;
+                let (gx, gz) = Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
+                Self::clear_entity_box(gx, gz, api);
+                self.render_ghost(gi, api);
+            }
+        }
     }
 
     fn advance_phase(&mut self) {
@@ -529,10 +665,27 @@ impl PacmanCart {
     }
 
     fn check_end(&mut self) {
-        for g in &self.ghosts {
+        for gi in 0..self.ghosts.len() {
+            let g = &self.ghosts[gi];
             if g.tx == self.player_tx && g.tz == self.player_tz {
-                self.state = GameState::Lost;
-                return;
+                match g.mode {
+                    GhostMode::Normal => {
+                        self.state = GameState::Lost;
+                        return;
+                    }
+                    GhostMode::Frightened => {
+                        // Eat the ghost. Score chain doubles per consecutive eat.
+                        self.ghost_chain = (self.ghost_chain + 1).min(4);
+                        let award = 200u32 << ((self.ghost_chain - 1).min(3) as u32);
+                        self.score += award;
+                        self.ghosts[gi].mode = GhostMode::Eaten;
+                        // Don't re-render — the player overlay covers this cell;
+                        // ghost re-renders as Eaten (white) on its next move.
+                    }
+                    GhostMode::Eaten => {
+                        // Eyes-only ghost is harmless until it respawns.
+                    }
+                }
             }
         }
         if self.pellets_remaining == 0 {
@@ -602,6 +755,13 @@ fn generate_maze() -> Vec<Vec<Tile>> {
             m[(c + dx) as usize][(c + dz) as usize] = Tile::Empty;
         }
     }
+    // 4 power pellets near the corners (interior, not on the outer wall).
+    let power_positions = [(2, 2), (n - 3, 2), (2, n - 3), (n - 3, n - 3)];
+    for (px, pz) in power_positions {
+        if m[px][pz] != Tile::Wall {
+            m[px][pz] = Tile::PowerPellet;
+        }
+    }
     m
 }
 
@@ -611,14 +771,17 @@ impl Cart for PacmanCart {
         api.print("WASD to move. Eat all pellets. Avoid the ghosts.");
         api.cam_pitch(75.0);
 
-        // Static sprites: wall + floor blocks.
+        // Static maze sprites.
         let _ = api.spr_load(SPR_WALL,  4, &make_solid_sprite_4(COLOR_WALL));
         let _ = api.spr_load(SPR_FLOOR, 4, &make_solid_sprite_4(COLOR_FLOOR));
-        // Entity sprites — one per behavior, color tied to COLOR_GHOST.
+        let _ = api.spr_load(SPR_POWER, 2, &make_solid_sprite_2(COLOR_POWER));
+        // Entity sprites — player + one per ghost behavior + frightened/eaten variants.
         let _ = api.spr_load(SPR_PLAYER, 4, &make_solid_sprite_4(COLOR_PLAYER));
         for (i, &c) in COLOR_GHOST.iter().enumerate() {
             let _ = api.spr_load(SPR_GHOST_BASE + i as u8, 4, &make_solid_sprite_4(c));
         }
+        let _ = api.spr_load(SPR_FRIGHT, 4, &make_solid_sprite_4(COLOR_FRIGHT));
+        let _ = api.spr_load(SPR_EATEN,  4, &make_solid_sprite_4(COLOR_EATEN));
 
         // Start in the first scatter phase.
         self.phase_index = 0;
@@ -632,8 +795,9 @@ impl Cart for PacmanCart {
         self.pellets_remaining = 0;
         for tx in 0..n {
             for tz in 0..n {
-                if self.maze[tx as usize][tz as usize] == Tile::Pellet {
-                    self.pellets_remaining += 1;
+                match self.maze[tx as usize][tz as usize] {
+                    Tile::Pellet | Tile::PowerPellet => self.pellets_remaining += 1,
+                    _ => {}
                 }
             }
         }
@@ -670,6 +834,7 @@ impl Cart for PacmanCart {
                 mode: GhostMode::Normal,
                 home_corner: corner,
                 spawn: corner,
+                last_move: 0,
             })
             .collect();
 
@@ -732,17 +897,42 @@ impl Cart for PacmanCart {
             }
         }
 
-        // Ghosts hold still during the intro grace period.
-        if t >= INTRO_GRACE && t.saturating_sub(self.last_ghost_move) >= GHOST_PERIOD {
+        // Ghosts hold still during the intro grace period; otherwise each ghost
+        // ticks on its own period (faster Eaten, slower Frightened).
+        if t >= INTRO_GRACE {
             for gi in 0..self.ghosts.len() {
-                self.move_ghost(gi, api);
+                let period = self.ghost_period(gi);
+                if t.saturating_sub(self.ghosts[gi].last_move) >= period {
+                    self.move_ghost(gi, api);
+                    self.ghosts[gi].last_move = t;
+                }
             }
-            self.last_ghost_move = t;
             self.check_end();
+            if self.state != GameState::Playing {
+                return;
+            }
         }
 
-        // Advance the scatter/chase phase clock.
-        if self.phase_timer != u64::MAX {
+        // Frightened countdown — when it hits zero, all Frightened ghosts revert
+        // to Normal in place and the phase timer resumes.
+        if self.frightened_timer > 0 {
+            self.frightened_timer -= 1;
+            if self.frightened_timer == 0 {
+                for gi in 0..self.ghosts.len() {
+                    if self.ghosts[gi].mode == GhostMode::Frightened {
+                        self.ghosts[gi].mode = GhostMode::Normal;
+                        let (gx, gz) =
+                            Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
+                        Self::clear_entity_box(gx, gz, api);
+                        self.render_ghost(gi, api);
+                    }
+                }
+                self.ghost_chain = 0;
+            }
+        }
+
+        // Advance the scatter/chase phase clock — paused while Frightened is active.
+        if self.frightened_timer == 0 && self.phase_timer != u64::MAX {
             self.phase_timer = self.phase_timer.saturating_sub(1);
             if self.phase_timer == 0 {
                 self.advance_phase();
