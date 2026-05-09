@@ -40,12 +40,43 @@ pub struct Instance {
     pub _pad1: f32,
 }
 
+/// A sprite — cubic voxel pattern, 4-bit cells, nibble-packed, even-parity relative
+/// positions only. Color 0 = transparent.
+struct Sprite {
+    size: u8,
+    /// `size³ / 4` bytes. Indexed by relative-cell compact index, same packing
+    /// convention as the display buffer.
+    data: Vec<u8>,
+}
+
+const SPRITE_SLOTS: usize = 256;
+
+#[inline]
+fn sprite_data_len(size: u8) -> Option<usize> {
+    match size {
+        2 | 4 | 8 | 16 => Some((size as usize).pow(3) / 4),
+        _ => None,
+    }
+}
+
+/// Compact index for a sprite-local cell. Same scheme as the display buffer:
+/// `z * size * (size/2) + y * (size/2) + (x >> 1)`. Sprite cells are valid iff
+/// `(x + y + z)` is even (lattice parity).
+#[inline]
+fn sprite_cell_index(size: u8, x: u8, y: u8, z: u8) -> usize {
+    let n = size as usize;
+    let half = n / 2;
+    (z as usize) * n * half + (y as usize) * half + ((x as usize) >> 1)
+}
+
 pub struct Console {
     /// Display buffer: 4 bits per valid cell, 2 cells per byte. Length = `VALID_CELLS / 2`
     /// = 524,288 bytes (512 KB), matching the spec.
     buffer: Vec<u8>,
     /// Per-cell count of filled face-neighbors (0..=12). One byte per valid cell.
     filled_neighbors: Vec<u8>,
+    /// Sprite bank, 256 slots. Each slot is `None` until `spr_load` is called.
+    sprites: Vec<Option<Sprite>>,
     pub palette: [Rgb; 16],
 
     pub instances: Vec<Instance>,
@@ -62,9 +93,12 @@ pub struct Console {
 
 impl Console {
     pub fn new() -> Self {
+        let mut sprites = Vec::with_capacity(SPRITE_SLOTS);
+        sprites.resize_with(SPRITE_SLOTS, || None);
         Self {
             buffer: vec![0u8; BUFFER_BYTES],
             filled_neighbors: vec![0u8; VALID_CELLS],
+            sprites,
             palette: DEFAULT_PALETTE,
             instances: Vec::with_capacity(1 << 18),
             cell_to_slot: HashMap::with_capacity(1 << 18),
@@ -162,6 +196,18 @@ pub trait CartApi {
     fn vox_fill(&mut self, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32, color: u8);
     fn vox_is_valid(&self, x: i32, y: i32, z: i32) -> bool;
     fn neighbor(&self, x: i32, y: i32, z: i32, idx: u8) -> (i32, i32, i32);
+
+    /// Register a cubic sprite. `size` must be 4, 8, or 16.
+    /// `data` length must be `size³ / 4` bytes (4-bit cells, nibble-packed,
+    /// even-parity relative positions only). Returns true on success.
+    fn spr_load(&mut self, id: u8, size: u8, data: &[u8]) -> bool;
+    /// Stamp a sprite into the display buffer at world cell (x, y, z).
+    /// Color 0 in the sprite is transparent. Anchor is parity-checked; out-of-grid
+    /// cells are silently skipped.
+    fn spr_draw(&mut self, id: u8, x: i32, y: i32, z: i32);
+    /// Drop a sprite from the bank. After this, `spr_draw(id, ...)` is a no-op.
+    fn spr_clear(&mut self, id: u8);
+
     fn pal_set(&mut self, slot: u8, r: f32, g: f32, b: f32);
     fn pal_reset(&mut self);
     fn cam_pitch(&mut self, deg: f32);
@@ -268,6 +314,51 @@ impl CartApi for Console {
     fn neighbor(&self, x: i32, y: i32, z: i32, idx: u8) -> (i32, i32, i32) {
         let o = NEIGHBOR_OFFSETS[(idx as usize).min(11)];
         (x + o[0], y + o[1], z + o[2])
+    }
+
+    fn spr_load(&mut self, id: u8, size: u8, data: &[u8]) -> bool {
+        let Some(expected) = sprite_data_len(size) else { return false };
+        if data.len() != expected {
+            return false;
+        }
+        self.sprites[id as usize] = Some(Sprite { size, data: data.to_vec() });
+        true
+    }
+
+    fn spr_draw(&mut self, id: u8, x: i32, y: i32, z: i32) {
+        // Anchor must be parity-valid; we draw even-parity relative cells, so
+        // (anchor.parity + relative.parity) must be even, i.e. anchor itself must
+        // be even-sum. Anything else is a no-op for spec consistency.
+        if !is_valid(x, y, z) {
+            return;
+        }
+        // Take the sprite out of the bank for the duration of the draw so we can
+        // freely call &mut self::vox_set in the inner loop. Returned at the end.
+        let Some(spr) = self.sprites[id as usize].take() else { return };
+        let size = spr.size as i32;
+
+        for rz in 0..size {
+            for ry in 0..size {
+                // For (rx + ry + rz) to be even, rx parity must match (ry + rz) parity.
+                let rx_start = (ry + rz) & 1;
+                let mut rx = rx_start;
+                while rx < size {
+                    let rel_idx = sprite_cell_index(spr.size, rx as u8, ry as u8, rz as u8);
+                    let byte = spr.data[rel_idx >> 1];
+                    let color = if (rel_idx & 1) == 0 { byte & 0x0F } else { byte >> 4 };
+                    if color != 0 {
+                        self.vox_set(x + rx, y + ry, z + rz, color);
+                    }
+                    rx += 2;
+                }
+            }
+        }
+
+        self.sprites[id as usize] = Some(spr);
+    }
+
+    fn spr_clear(&mut self, id: u8) {
+        self.sprites[id as usize] = None;
     }
 
     fn pal_set(&mut self, slot: u8, r: f32, g: f32, b: f32) {

@@ -141,6 +141,36 @@ impl Cart for DemoCart {
 }
 
 // ============================================================================
+//  Sprite-data helpers (cart-side authoring).
+// ============================================================================
+
+/// Build a 4³ sprite where each y-layer is filled with a single color.
+/// Returns the 16-byte nibble-packed data the emulator expects.
+fn make_layered_sprite_4(layers: [u8; 4]) -> [u8; 16] {
+    let size: u8 = 4;
+    let mut data = [0u8; 16];
+    for rz in 0..size {
+        for ry in 0..size {
+            let mut rx = (ry + rz) & 1;
+            while rx < size {
+                let rel_idx = (rz as usize) * (size as usize) * (size as usize / 2)
+                    + (ry as usize) * (size as usize / 2)
+                    + ((rx as usize) >> 1);
+                let color = layers[ry as usize] & 0x0F;
+                let byte_idx = rel_idx >> 1;
+                if rel_idx & 1 == 0 {
+                    data[byte_idx] |= color;
+                } else {
+                    data[byte_idx] |= color << 4;
+                }
+                rx += 2;
+            }
+        }
+    }
+    data
+}
+
+// ============================================================================
 //  PacmanCart — voxel pacman.
 // ============================================================================
 
@@ -441,6 +471,16 @@ impl Cart for PacmanCart {
         self.render_player(api);
         for gi in 0..self.ghosts.len() {
             self.render_ghost(gi, api);
+        }
+
+        // Sprite test: a 4-layer totem (yellow, orange, red, purple) anchored above
+        // the central spawn point. Validates spr_load + spr_draw on the new API.
+        let totem = make_layered_sprite_4([11, 12, 13, 15]);
+        if api.spr_load(0, 4, &totem) {
+            let (cx, cz) = Self::tile_to_world(MAZE_SIZE / 2, MAZE_SIZE / 2);
+            api.spr_draw(0, cx, GAME_Y + 4, cz);
+        } else {
+            api.print("spr_load failed");
         }
 
         api.print(&format!("Pellets: {}", self.pellets_remaining));
