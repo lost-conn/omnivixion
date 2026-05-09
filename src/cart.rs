@@ -211,6 +211,17 @@ const TITLE_Y: i32 = 4;
 const TITLE_Z: i32 = 30;
 const TITLE_MAX_CHARS: i32 = 16;
 
+// HUD on a horizontal plane just to the right of the maze, XZFloor orientation.
+// Stacked four lines in +Z (each line is 8 cells "below" the previous on screen
+// at the default overhead camera).
+const HUD_X: i32 = 96;
+const HUD_Y: i32 = 6;
+const HUD_Z_BASE: i32 = 36;
+const HUD_MAX_CHARS: i32 = 5;
+
+const LIVES_START: u8 = 3;
+const RESPAWN_GRACE: u64 = 60;
+
 const COLOR_FLOOR:  u8 = 4;   // grass — empty corridor
 const COLOR_WALL:   u8 = 8;   // stone
 const COLOR_PELLET: u8 = 10;  // snow/white — small dots on the floor
@@ -304,6 +315,7 @@ pub struct PacmanCart {
     ghosts: Vec<Ghost>,
     pellets_remaining: u32,
     score: u32,
+    lives: u8,
     state: GameState,
     phase: GamePhase,
     phase_timer: u64,
@@ -312,6 +324,11 @@ pub struct PacmanCart {
     frightened_timer: u64,
     /// Consecutive ghosts eaten in current Frightened spell.
     ghost_chain: u8,
+    /// Tick threshold below which ghosts hold still after a respawn.
+    respawn_until: u64,
+    /// Last values we drew into the HUD; we only restamp on change.
+    last_drawn_score: Option<u32>,
+    last_drawn_lives: Option<u8>,
     rng: u64,
     last_player_move: u64,
     announced_end: bool,
@@ -327,12 +344,16 @@ impl PacmanCart {
             ghosts: Vec::new(),
             pellets_remaining: 0,
             score: 0,
+            lives: LIVES_START,
             state: GameState::Playing,
             phase: GamePhase::Scatter,
             phase_timer: 0,
             phase_index: 0,
             frightened_timer: 0,
             ghost_chain: 0,
+            respawn_until: 0,
+            last_drawn_score: None,
+            last_drawn_lives: None,
             rng: 0xDEAD_BEEF_CAFE_BABE,
             last_player_move: 0,
             announced_end: false,
@@ -390,6 +411,74 @@ impl PacmanCart {
             0,
         );
         api.text_draw_axis(s, TITLE_X, TITLE_Y, TITLE_Z, color, TextOrient::XZFloor);
+    }
+
+    /// Stamp one HUD line (XZFloor) at (HUD_X, HUD_Y, anchor_z) with the bbox
+    /// cleared first so previous values are erased.
+    fn draw_hud_line(api: &mut dyn CartApi, anchor_z: i32, s: &str, color: u8) {
+        let advance = api.text_advance() as i32;
+        let height = api.text_height() as i32;
+        let max_w = HUD_MAX_CHARS * advance;
+        // XZFloor: text extends +X for advance, -Z for glyph height. Snap on Y.
+        api.vox_fill(
+            HUD_X, HUD_Y, anchor_z - height,
+            HUD_X + max_w, HUD_Y + 1, anchor_z + 1,
+            0,
+        );
+        api.text_draw_axis(s, HUD_X, HUD_Y, anchor_z, color, TextOrient::XZFloor);
+    }
+
+    fn redraw_hud_if_dirty(&mut self, api: &mut dyn CartApi) {
+        if self.last_drawn_score != Some(self.score) {
+            if self.last_drawn_score.is_none() {
+                Self::draw_hud_line(api, HUD_Z_BASE, "SCORE", COLOR_PELLET);
+            }
+            Self::draw_hud_line(api, HUD_Z_BASE + 8, &format!("{:05}", self.score), COLOR_PELLET);
+            self.last_drawn_score = Some(self.score);
+        }
+        if self.last_drawn_lives != Some(self.lives) {
+            if self.last_drawn_lives.is_none() {
+                Self::draw_hud_line(api, HUD_Z_BASE + 16, "LIVES", COLOR_PLAYER);
+            }
+            Self::draw_hud_line(api, HUD_Z_BASE + 24, &format!("{}", self.lives), COLOR_PLAYER);
+            self.last_drawn_lives = Some(self.lives);
+        }
+    }
+
+    /// Move player + all ghosts back to their spawn tiles, drop any in-flight
+    /// Frightened/Eaten state, and start a brief grace window before ghosts move
+    /// again. Pellets and score persist.
+    fn soft_reset(&mut self, t: u64, api: &mut dyn CartApi) {
+        let (px, pz) = Self::tile_to_world(self.player_tx, self.player_tz);
+        Self::clear_entity_box(px, pz, api);
+        self.stamp_tile(self.player_tx, self.player_tz, api);
+
+        self.player_tx = MAZE_SIZE / 2;
+        self.player_tz = MAZE_SIZE / 2;
+        self.player_dir = (0, -1);
+
+        for gi in 0..self.ghosts.len() {
+            let (gx, gz) = Self::tile_to_world(self.ghosts[gi].tx, self.ghosts[gi].tz);
+            Self::clear_entity_box(gx, gz, api);
+            self.stamp_tile(self.ghosts[gi].tx, self.ghosts[gi].tz, api);
+
+            let g = &mut self.ghosts[gi];
+            g.tx = g.spawn.0;
+            g.tz = g.spawn.1;
+            g.last_dir = (0, 0);
+            g.mode = GhostMode::Normal;
+            g.last_move = t;
+        }
+
+        self.frightened_timer = 0;
+        self.ghost_chain = 0;
+        self.respawn_until = t + RESPAWN_GRACE;
+
+        // Re-render player and ghosts at their fresh positions.
+        self.render_player(api);
+        for gi in 0..self.ghosts.len() {
+            self.render_ghost(gi, api);
+        }
     }
 
     fn render_static_world(&self, api: &mut dyn CartApi) {
@@ -664,14 +753,20 @@ impl PacmanCart {
         z ^ (z >> 31)
     }
 
-    fn check_end(&mut self) {
+    fn check_end(&mut self, t: u64, api: &mut dyn CartApi) {
+        let mut lost_life = false;
         for gi in 0..self.ghosts.len() {
             let g = &self.ghosts[gi];
             if g.tx == self.player_tx && g.tz == self.player_tz {
                 match g.mode {
                     GhostMode::Normal => {
-                        self.state = GameState::Lost;
-                        return;
+                        self.lives = self.lives.saturating_sub(1);
+                        if self.lives == 0 {
+                            self.state = GameState::Lost;
+                            return;
+                        }
+                        lost_life = true;
+                        break;
                     }
                     GhostMode::Frightened => {
                         // Eat the ghost. Score chain doubles per consecutive eat.
@@ -687,6 +782,10 @@ impl PacmanCart {
                     }
                 }
             }
+        }
+        if lost_life {
+            self.soft_reset(t, api);
+            return;
         }
         if self.pellets_remaining == 0 {
             self.state = GameState::Won;
@@ -844,9 +943,11 @@ impl Cart for PacmanCart {
             self.render_ghost(gi, api);
         }
 
-        // Title text floating above the maze. Exercises mixed case + digits +
-        // punctuation through the renderer.
+        // Title text floating above the maze.
         Self::draw_title(api, "Pacman v0.1!", COLOR_PELLET);
+
+        // Initial HUD stamp.
+        self.redraw_hud_if_dirty(api);
 
         api.print(&format!("Pellets: {}", self.pellets_remaining));
     }
@@ -891,15 +992,15 @@ impl Cart for PacmanCart {
             if let Some((dx, dz)) = dir {
                 if self.try_move_player(dx, dz, api) {
                     self.last_player_move = t;
-                    self.check_end();
+                    self.check_end(t, api);
                     if self.state != GameState::Playing { return; }
                 }
             }
         }
 
-        // Ghosts hold still during the intro grace period; otherwise each ghost
-        // ticks on its own period (faster Eaten, slower Frightened).
-        if t >= INTRO_GRACE {
+        // Ghosts hold still during the intro grace period and after each respawn;
+        // otherwise each ghost ticks on its own period.
+        if t >= INTRO_GRACE && t >= self.respawn_until {
             for gi in 0..self.ghosts.len() {
                 let period = self.ghost_period(gi);
                 if t.saturating_sub(self.ghosts[gi].last_move) >= period {
@@ -907,7 +1008,7 @@ impl Cart for PacmanCart {
                     self.ghosts[gi].last_move = t;
                 }
             }
-            self.check_end();
+            self.check_end(t, api);
             if self.state != GameState::Playing {
                 return;
             }
@@ -938,5 +1039,8 @@ impl Cart for PacmanCart {
                 self.advance_phase();
             }
         }
+
+        // Repaint the HUD when score / lives change.
+        self.redraw_hud_if_dirty(api);
     }
 }
