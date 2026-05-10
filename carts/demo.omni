@@ -1,0 +1,167 @@
+omnivixion cart v0.1
+
+__header__
+[meta]
+spec   = "0.1"
+name   = "Landscape"
+author = "seth"
+desc   = "procedural terrain showcase"
+
+[runtime]
+lang = "lua"
+hz   = 60
+
+[display]
+default_pitch  = 30
+persist_buffer = true
+
+__lua__
+-- =====================================================================
+-- Landscape demo. Layered-sine heightfield, sea fill, scattered trees,
+-- central mountain with a sky tower and a blinking beacon. Buttons 6/7
+-- (Z / X) nudge camera pitch by 10°.
+-- =====================================================================
+
+local N         = 128
+local SEA_LEVEL = 16
+
+local mountain_top_x = 64
+local mountain_top_z = 64
+local beacon_y       = 0
+
+local function height_at(x, z)
+  local cx   = x - 64.0
+  local cz   = z - 64.0
+  local dist = math.sqrt(cx * cx + cz * cz)
+
+  local h = 18.0
+  h = h + 11.0 * math.sin(x * 0.062) * math.cos(z * 0.054)
+  h = h + 6.0  * math.sin((x + z) * 0.13)
+  h = h + 4.0  * math.cos(x * 0.21 - z * 0.18)
+  h = h + 2.5  * math.sin(x * 0.41) * math.cos(z * 0.39)
+  h = h + math.max(0.0, 38.0 - dist * 0.78)
+  h = h + 6.0  * math.exp(-((dist - 50.0) / 14.0) ^ 2)
+
+  h = math.floor(h)
+  if h < 2  then h = 2  end
+  if h > 95 then h = 95 end
+  return h
+end
+
+local function color_for_elevation(y, top)
+  if y <= SEA_LEVEL + 1 then
+    if y == top then return 3 else return 7 end
+  elseif y < 28 then return 4
+  elseif y < 34 then return 5
+  elseif y < 50 then return 8
+  elseif y < 65 then return 9
+  else               return 10
+  end
+end
+
+function init()
+  print("Generating world...")
+
+  -- Terrain.
+  for x = 0, N - 1 do
+    for z = 0, N - 1 do
+      local top = height_at(x, z)
+      for y = 0, top do
+        if (x + y + z) % 2 == 0 then
+          vox_set(x, y, z, color_for_elevation(y, top))
+        end
+      end
+    end
+  end
+
+  -- Sea fill.
+  for x = 0, N - 1 do
+    for z = 0, N - 1 do
+      local top = height_at(x, z)
+      for y = top + 1, SEA_LEVEL do
+        if (x + y + z) % 2 == 0 then
+          vox_set(x, y, z, 2)
+        end
+      end
+    end
+  end
+
+  -- Trees: 900 random spheres on dryish low ground.
+  for _ = 1, 900 do
+    local x   = math.floor(rand() * N)
+    local z   = math.floor(rand() * N)
+    local top = height_at(x, z)
+    if top >= SEA_LEVEL + 2 and top <= 32 then
+      for dy = 1, 4 do
+        vox_set(x, top + dy, z, 7)
+      end
+      for dx = -2, 2 do
+        for dz = -2, 2 do
+          for dy = 3, 7 do
+            local cy = dy - 5
+            local r2 = dx * dx + dz * dz + cy * cy
+            if r2 <= 5.5 then
+              vox_set(x + dx, top + dy, z + dz, 6)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- Find the highest cell within 4 of map-center; that's where the tower goes.
+  local peak_y = 0
+  for dx = -4, 4 do
+    for dz = -4, 4 do
+      local h = height_at(64 + dx, 64 + dz)
+      if h > peak_y then
+        peak_y         = h
+        mountain_top_x = 64 + dx
+        mountain_top_z = 64 + dz
+      end
+    end
+  end
+
+  -- Tower: stepped cylinder, hollow at the top.
+  local tower_height = 22
+  for dy = 1, tower_height do
+    local y      = peak_y + dy
+    local radius = (dy < 4) and 3 or 2
+    for dx = -radius, radius do
+      for dz = -radius, radius do
+        if dx * dx + dz * dz <= radius * radius then
+          local hollow = dy >= tower_height - 4
+                     and dx * dx + dz * dz < (radius - 1) * (radius - 1)
+          if not hollow then
+            local cx    = mountain_top_x + dx
+            local cz    = mountain_top_z + dz
+            local color = (dy < 5) and 9 or 8
+            vox_set(cx, y, cz, color)
+          end
+        end
+      end
+    end
+  end
+
+  beacon_y = peak_y + tower_height + 2
+  vox_set(mountain_top_x, beacon_y, mountain_top_z, 13)
+
+  print("done.")
+end
+
+function update(dt)
+  local t   = time()
+  local lit = math.floor(t / 30) % 2 == 0
+  vox_set(mountain_top_x, beacon_y, mountain_top_z, lit and 13 or 11)
+
+  if btnp(6) then
+    local p = cam_pitch_get() + 10.0
+    if p > 90.0 then p = 90.0 end
+    cam_pitch(p)
+  end
+  if btnp(7) then
+    local p = cam_pitch_get() - 10.0
+    if p < 0.0 then p = 0.0 end
+    cam_pitch(p)
+  end
+end

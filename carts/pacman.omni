@@ -5,7 +5,7 @@ __header__
 spec   = "0.1"
 name   = "Pacman"
 author = "seth"
-desc   = "voxel pacman, Lua port of PacmanCart"
+desc   = "voxel pacman"
 
 [runtime]
 lang = "lua"
@@ -17,9 +17,7 @@ persist_buffer = false
 
 __lua__
 -- =====================================================================
--- Pacman v0.1 — Lua port of src/cart.rs::PacmanCart.
--- Plays identically to the Rust reference. WASD to move, Z to restart
--- after a game-over.
+-- Pacman v0.1. WASD to move, Z to restart after a game-over.
 -- =====================================================================
 
 -- ---------- world / animation constants -------------------------------

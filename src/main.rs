@@ -5,7 +5,7 @@ mod lattice;
 mod loader;
 mod render;
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,7 +18,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use cart::{Cart, DemoCart, PacmanCart};
+use cart::Cart;
 use console::Console;
 use lattice::N;
 use render::Renderer;
@@ -262,12 +262,10 @@ fn main() -> Result<()> {
 
 fn select_cart() -> Result<Box<dyn Cart>> {
     let args: Vec<String> = std::env::args().collect();
-    if let Some(i) = args.iter().position(|a| a == "--cart") {
-        let path = args.get(i + 1).context("--cart requires a path argument")?;
-        loader::load_cart_from_path(Path::new(path))
-    } else if args.iter().any(|a| a == "--demo") {
-        Ok(Box::new(DemoCart::new()))
+    let path = if let Some(i) = args.iter().position(|a| a == "--cart") {
+        PathBuf::from(args.get(i + 1).context("--cart requires a path argument")?)
     } else {
-        Ok(Box::new(PacmanCart::new()))
-    }
+        PathBuf::from("carts").join("pacman.omni")
+    };
+    loader::load_cart_from_path(&path)
 }
