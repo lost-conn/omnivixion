@@ -48,8 +48,8 @@ Sweet spot for "cheap hardware" emulators. 525 KB framebuffer, ~52 K typical sur
 
 ## 5. Cart format & memory
 
-- **Cart binary:** Up to **512 KB** compressed. Holds code, assets, palette, header.
-- **Header:** Fixed 256-byte block at start of cart. Includes spec version, name, author, default palette index, preferred camera hint, audio bank count, and code-segment offset/length. Format locked during v0.2.
+- **Cart format (v0.1 text):** Carts ship as `.omni` text files — one human-inspectable file per cart, sectioned by `__name__` markers, with a TOML header. Full grammar in [`CART_FORMAT.md`](CART_FORMAT.md). The 512 KB compressed-binary form is a v0.2 concern; in v0.1 the text form is canonical and the loader parses it directly.
+- **Header:** Defined as a TOML body inside the `__header__` section — see `CART_FORMAT.md` §2. Includes spec version, name, author, runtime selection, default pitch, persist-buffer flag, default palette slot, and audio bank count (reserved). The fixed 256-byte binary header described in earlier drafts is deferred to the bundled-binary form (v0.2).
 - **Code:** Initially Lua via embedded `mlua`. WASM cart support deferred to v0.2 — same syscall ABI, different runtime.
 - **Working RAM:** **256 KB** beyond the display buffer. Cart's variables, structures, level data live here.
 - **Asset budget within cart:** Whatever fits in the 512 KB once code is compressed. A 16³ voxel "sprite" costs ~1 KB at 4 bpp; expect 100+ sprites possible.
@@ -163,10 +163,10 @@ A conformant emulator must run any v0.x cart correctly. Performance profiles des
 ## 11. Open questions (lock during v0.2)
 
 - Default 15-color palette.
-- Cart header byte layout.
+- Cart header byte layout for the bundled/compressed binary form. (The v0.1 text-format header is locked in `CART_FORMAT.md` §2.)
 - Cart compression algorithm (zstd? LZ4? domain-specific RLE for voxel runs?).
 - Audio system shape.
-- WASM cart ABI (mirror Lua syscalls 1:1, or richer?).
+- WASM cart ABI (mirror Lua syscalls 1:1, or richer?). Section reserved as `__wasm__` in `CART_FORMAT.md`.
 - Save state / save data semantics.
 - Multi-cart linking (cartridges that load other cartridges?). Probably no.
 

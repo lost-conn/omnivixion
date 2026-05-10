@@ -2,12 +2,14 @@ mod cart;
 mod console;
 mod font;
 mod lattice;
+mod loader;
 mod render;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use glam::Vec3;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -71,12 +73,7 @@ const LOGIC_DT: f32 = 1.0 / LOGIC_HZ;
 const MAX_UPDATES_PER_FRAME: u32 = 5; // avoid spiral of death after long stalls
 
 impl App {
-    fn new() -> Self {
-        let cart: Box<dyn Cart> = if std::env::args().any(|a| a == "--demo") {
-            Box::new(DemoCart::new())
-        } else {
-            Box::new(PacmanCart::new())
-        };
+    fn new(cart: Box<dyn Cart>) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -253,10 +250,24 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let cart = select_cart()?;
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let mut app = App::new();
+    let mut app = App::new(cart);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+fn select_cart() -> Result<Box<dyn Cart>> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--cart") {
+        let path = args.get(i + 1).context("--cart requires a path argument")?;
+        loader::load_cart_from_path(Path::new(path))
+    } else if args.iter().any(|a| a == "--demo") {
+        Ok(Box::new(DemoCart::new()))
+    } else {
+        Ok(Box::new(PacmanCart::new()))
+    }
 }

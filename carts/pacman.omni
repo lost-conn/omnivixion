@@ -1,0 +1,749 @@
+omnivixion cart v0.1
+
+__header__
+[meta]
+spec   = "0.1"
+name   = "Pacman"
+author = "seth"
+desc   = "voxel pacman, Lua port of PacmanCart"
+
+[runtime]
+lang = "lua"
+hz   = 60
+
+[display]
+default_pitch  = 30
+persist_buffer = false
+
+__lua__
+-- =====================================================================
+-- Pacman v0.1 — Lua port of src/cart.rs::PacmanCart.
+-- Plays identically to the Rust reference. WASD to move, Z to restart
+-- after a game-over.
+-- =====================================================================
+
+-- ---------- world / animation constants -------------------------------
+
+local MAZE_SIZE = 16
+local STRIDE    = 4
+local MAZE_X0   = 32
+local MAZE_Z0   = 32
+local GAME_Y    = 2
+
+local SUB_STEPS       = 4
+local PLAYER_PERIOD   = 8
+local GHOST_PERIOD    = 20
+local FRIGHT_PERIOD   = 28
+local EATEN_PERIOD    = 8
+local INTRO_GRACE     = 60
+local FRIGHT_DURATION = 360
+local LIVES_START     = 3
+local RESPAWN_GRACE   = 60
+
+local TITLE_X         = 16
+local TITLE_Y         = 4
+local TITLE_Z         = 30
+local TITLE_MAX_CHARS = 16
+
+local HUD_X        = 96
+local HUD_Y        = 6
+local HUD_Z_BASE   = 36
+local HUD_MAX_CHARS = 5
+
+-- ---------- enums (just integers; Lua has no enum type) ---------------
+
+local TILE_WALL, TILE_PELLET, TILE_POWER, TILE_EMPTY = 0, 1, 2, 3
+local STATE_PLAYING, STATE_WON, STATE_LOST           = 0, 1, 2
+local GB_BLINKY, GB_PINKY, GB_INKY, GB_CLYDE         = 0, 1, 2, 3
+local GM_NORMAL, GM_FRIGHTENED, GM_EATEN             = 0, 1, 2
+local PHASE_SCATTER, PHASE_CHASE                     = 0, 1
+
+-- ---------- palette / sprite ids --------------------------------------
+
+local COLOR_WALL   = 8
+local COLOR_PELLET = 10
+local COLOR_PLAYER = 11
+local COLOR_POWER  = 14
+local COLOR_FRIGHT = 1
+local COLOR_EATEN  = 10
+local COLOR_GHOST  = { 13, 14, 2, 12 }    -- Blinky, Pinky, Inky, Clyde
+
+local SPR_WALL       = 0
+local SPR_POWER      = 2
+local SPR_PLAYER     = 3
+local SPR_GHOST_BASE = 4
+local SPR_FRIGHT     = 8
+local SPR_EATEN      = 9
+
+-- Indefinite-chase sentinel. Saturating-sub stays put forever.
+local INDEFINITE = math.maxinteger
+local PHASE_SCHEDULE = {
+  { PHASE_SCATTER, 420  },
+  { PHASE_CHASE,   1200 },
+  { PHASE_SCATTER, 420  },
+  { PHASE_CHASE,   1200 },
+  { PHASE_SCATTER, 300  },
+  { PHASE_CHASE,   1200 },
+  { PHASE_SCATTER, 300  },
+  { PHASE_CHASE,   INDEFINITE },
+}
+
+-- ---------- cart state ------------------------------------------------
+
+local maze              = {}
+local player_tx         = 0
+local player_tz         = 0
+local player_dir        = { 0, 0 }
+local desired_dir       = { 0, 0 }
+local player_anim       = nil
+local ghosts            = {}
+local pellets_remaining = 0
+local score             = 0
+local lives             = LIVES_START
+local game_state        = STATE_PLAYING
+local phase             = PHASE_SCATTER
+local phase_timer       = 0
+local phase_index       = 1
+local frightened_timer  = 0
+local ghost_chain       = 0
+local respawn_until     = 0
+local rng_state         = 0xDEADBEEFCAFEBABE
+local announced_end     = false
+
+-- ---------- helpers ---------------------------------------------------
+
+local function in_bounds(tx, tz)
+  return tx >= 0 and tx < MAZE_SIZE and tz >= 0 and tz < MAZE_SIZE
+end
+
+local function tile_to_world(tx, tz)
+  return MAZE_X0 + STRIDE * tx, MAZE_Z0 + STRIDE * tz
+end
+
+local function anim_anchor(a)
+  local sx, sz = tile_to_world(a.src_tx, a.src_tz)
+  local n   = a.sub_step
+  local bob = a.sub_step & 1
+  return sx + n * a.dx, GAME_Y + bob, sz + n * a.dz
+end
+
+local function idle_anchor(tx, tz)
+  local sx, sz = tile_to_world(tx, tz)
+  return sx, GAME_Y, sz
+end
+
+local function player_anchor()
+  if player_anim then return anim_anchor(player_anim) end
+  return idle_anchor(player_tx, player_tz)
+end
+
+local function ghost_anchor(g)
+  if g.anim then return anim_anchor(g.anim) end
+  return idle_anchor(g.tx, g.tz)
+end
+
+-- SplitMix64. Lua 5.4 integers are 64-bit and wrap on overflow, so the
+-- arithmetic matches the Rust impl bit-for-bit.
+local function rng_step()
+  rng_state = rng_state + 0x9E3779B97F4A7C15
+  local z = rng_state
+  z = (z ~ (z >> 30)) * 0xBF58476D1CE4E5B9
+  z = (z ~ (z >> 27)) * 0x94D049BB133111EB
+  z = z ~ (z >> 31)
+  return z
+end
+
+-- Build the byte-string for a solid-color cubic sprite. `size^3 / 2` cells
+-- packed as `size^3 / 4` bytes, every parity-even cell set to `color`.
+local function solid_sprite(size, color)
+  local c = color & 0x0f
+  local byte = string.char(c | (c << 4))
+  return string.rep(byte, (size * size * size) // 4)
+end
+
+-- ---------- maze generation ------------------------------------------
+
+local function generate_maze()
+  local n = MAZE_SIZE
+  local m = {}
+  for x = 1, n do
+    m[x] = {}
+    for z = 1, n do m[x][z] = TILE_PELLET end
+  end
+  -- Outer wall.
+  for i = 1, n do
+    m[i][1] = TILE_WALL
+    m[i][n] = TILE_WALL
+    m[1][i] = TILE_WALL
+    m[n][i] = TILE_WALL
+  end
+  -- Internal symmetric blocks (placed in the upper-left quadrant, mirrored 4×).
+  -- 0-indexed (bx, bz, w, h) per the Rust source.
+  local blocks = { { 3, 3, 2, 1 }, { 3, 6, 1, 2 }, { 6, 3, 1, 1 } }
+  for _, b in ipairs(blocks) do
+    local bx, bz, w, h = b[1], b[2], b[3], b[4]
+    for dx = 0, w - 1 do
+      for dz = 0, h - 1 do
+        local tx, tz = bx + dx, bz + dz
+        m[tx + 1][tz + 1]         = TILE_WALL
+        m[n - tx][tz + 1]         = TILE_WALL
+        m[tx + 1][n - tz]         = TILE_WALL
+        m[n - tx][n - tz]         = TILE_WALL
+      end
+    end
+  end
+  -- Central spawn area (3×3) Empty.
+  local c = n // 2
+  for dx = -1, 1 do
+    for dz = -1, 1 do
+      m[c + dx + 1][c + dz + 1] = TILE_EMPTY
+    end
+  end
+  -- Power pellets near the corners (interior).
+  local power_positions = { { 2, 2 }, { n - 3, 2 }, { 2, n - 3 }, { n - 3, n - 3 } }
+  for _, p in ipairs(power_positions) do
+    local px, pz = p[1], p[2]
+    if m[px + 1][pz + 1] ~= TILE_WALL then
+      m[px + 1][pz + 1] = TILE_POWER
+    end
+  end
+  return m
+end
+
+-- ---------- rendering ------------------------------------------------
+
+local function stamp_tile(tx, tz)
+  local ax, az = tile_to_world(tx, tz)
+  local t = maze[tx + 1][tz + 1]
+  if t == TILE_WALL then
+    spr_draw(SPR_WALL, ax, GAME_Y, az)
+  elseif t == TILE_PELLET then
+    vox_set(ax + 2, GAME_Y + 2, az + 2, COLOR_PELLET)
+  elseif t == TILE_POWER then
+    spr_draw(SPR_POWER, ax + 1, GAME_Y, az + 1)
+  end
+end
+
+local function draw_title(s, color)
+  local advance = text_advance()
+  local height  = text_height()
+  local max_w   = TITLE_MAX_CHARS * advance
+  vox_fill(
+    TITLE_X, TITLE_Y, TITLE_Z - height,
+    TITLE_X + max_w, TITLE_Y + 1, TITLE_Z + 1,
+    0
+  )
+  text_draw_axis(s, TITLE_X, TITLE_Y, TITLE_Z, color, "xz_floor")
+end
+
+local function draw_hud_line(anchor_z, s, color)
+  local advance = text_advance()
+  local height  = text_height()
+  local max_w   = HUD_MAX_CHARS * advance
+  vox_fill(
+    HUD_X, HUD_Y, anchor_z - height,
+    HUD_X + max_w, HUD_Y + 1, anchor_z + 1,
+    0
+  )
+  text_draw_axis(s, HUD_X, HUD_Y, anchor_z, color, "xz_floor")
+end
+
+local function draw_restart_prompt()
+  local advance = text_advance()
+  local height  = text_height()
+  local s       = "PRESS Z"
+  local max_w   = #s * advance
+  local z       = TITLE_Z + 12
+  vox_fill(
+    TITLE_X, TITLE_Y, z - height,
+    TITLE_X + max_w, TITLE_Y + 1, z + 1,
+    0
+  )
+  text_draw_axis(s, TITLE_X, TITLE_Y, z, COLOR_PELLET, "xz_floor")
+end
+
+local function render_player()
+  local x, y, z = player_anchor()
+  spr_draw(SPR_PLAYER, x, y, z)
+end
+
+local function render_ghost(gi)
+  local g = ghosts[gi]
+  local sprite_id
+  if     g.mode == GM_NORMAL     then sprite_id = SPR_GHOST_BASE + (gi - 1)
+  elseif g.mode == GM_FRIGHTENED then sprite_id = SPR_FRIGHT
+  else                                sprite_id = SPR_EATEN
+  end
+  local x, y, z = ghost_anchor(g)
+  spr_draw(sprite_id, x, y, z)
+end
+
+local function render_world()
+  if game_state == STATE_PLAYING then
+    for tx = 0, MAZE_SIZE - 1 do
+      for tz = 0, MAZE_SIZE - 1 do
+        stamp_tile(tx, tz)
+      end
+    end
+  else
+    local fill = (game_state == STATE_WON) and COLOR_PELLET or 13
+    for tx = 0, MAZE_SIZE - 1 do
+      for tz = 0, MAZE_SIZE - 1 do
+        local ax, az = tile_to_world(tx, tz)
+        if maze[tx + 1][tz + 1] == TILE_WALL then
+          spr_draw(SPR_WALL, ax, GAME_Y, az)
+        else
+          vox_fill(ax, GAME_Y, az, ax + 3, GAME_Y + 3, az + 3, fill)
+        end
+      end
+    end
+  end
+
+  if game_state == STATE_PLAYING then
+    draw_title("Pacman v0.1!", COLOR_PELLET)
+  elseif game_state == STATE_WON then
+    draw_title("WIN!", COLOR_PELLET)
+    draw_restart_prompt()
+  else
+    draw_title("LOST", 13)
+    draw_restart_prompt()
+  end
+
+  draw_hud_line(HUD_Z_BASE,      "SCORE",                COLOR_PELLET)
+  draw_hud_line(HUD_Z_BASE + 8,  string.format("%05d", score), COLOR_PELLET)
+  draw_hud_line(HUD_Z_BASE + 16, "LIVES",                COLOR_PLAYER)
+  draw_hud_line(HUD_Z_BASE + 24, tostring(lives),        COLOR_PLAYER)
+
+  render_player()
+  for gi = 1, #ghosts do render_ghost(gi) end
+end
+
+-- ---------- movement / AI -------------------------------------------
+
+local function can_move_to(tx, tz, dx, dz)
+  local nx, nz = tx + dx, tz + dz
+  if not in_bounds(nx, nz) then return false end
+  return maze[nx + 1][nz + 1] ~= TILE_WALL
+end
+
+local function start_player_move(dx, dz)
+  if dx == 0 and dz == 0 then return false end
+  if not can_move_to(player_tx, player_tz, dx, dz) then return false end
+  player_anim = {
+    src_tx = player_tx, src_tz = player_tz,
+    dx = dx, dz = dz, sub_step = 0, sub_frame = 0,
+  }
+  player_dir = { dx, dz }
+  return true
+end
+
+local function frames_per_sub_step_player() return PLAYER_PERIOD // SUB_STEPS end
+local function frames_per_sub_step_ghost(mode)
+  local period
+  if     mode == GM_NORMAL     then period = GHOST_PERIOD
+  elseif mode == GM_FRIGHTENED then period = FRIGHT_PERIOD
+  else                              period = EATEN_PERIOD
+  end
+  return period // SUB_STEPS
+end
+
+local function trigger_frightened()
+  frightened_timer = FRIGHT_DURATION
+  ghost_chain = 0
+  for _, g in ipairs(ghosts) do
+    if g.mode == GM_NORMAL then
+      g.mode     = GM_FRIGHTENED
+      g.last_dir = { -g.last_dir[1], -g.last_dir[2] }
+      g.anim     = nil
+    end
+  end
+end
+
+local function target_for_ghost(gi)
+  local g = ghosts[gi]
+  if phase == PHASE_SCATTER then
+    return g.home_corner[1], g.home_corner[2]
+  end
+  if g.behavior == GB_BLINKY then
+    return player_tx, player_tz
+  elseif g.behavior == GB_PINKY then
+    return player_tx + player_dir[1] * 4, player_tz + player_dir[2] * 4
+  elseif g.behavior == GB_INKY then
+    local bx, bz = 0, 0
+    for _, gg in ipairs(ghosts) do
+      if gg.behavior == GB_BLINKY then bx, bz = gg.tx, gg.tz; break end
+    end
+    local pivot_x = player_tx + player_dir[1] * 2
+    local pivot_z = player_tz + player_dir[2] * 2
+    return 2 * pivot_x - bx, 2 * pivot_z - bz
+  else  -- CLYDE
+    local dx = g.tx - player_tx
+    local dz = g.tz - player_tz
+    if math.abs(dx) + math.abs(dz) > 8 then
+      return player_tx, player_tz
+    else
+      return g.home_corner[1], g.home_corner[2]
+    end
+  end
+end
+
+local DIRS_TIEBREAK = { { 0, -1 }, { -1, 0 }, { 0, 1 }, { 1, 0 } }
+
+local function pick_best_toward(gi, tx, tz)
+  local g = ghosts[gi]
+  local last = g.last_dir
+  local avoid_x, avoid_z = -last[1], -last[2]
+  local function try_pick(allow_reverse)
+    local best_dist, best_dir = nil, nil
+    for _, d in ipairs(DIRS_TIEBREAK) do
+      local dx, dz = d[1], d[2]
+      local nx, nz = g.tx + dx, g.tz + dz
+      if in_bounds(nx, nz) and maze[nx + 1][nz + 1] ~= TILE_WALL then
+        if allow_reverse or not (dx == avoid_x and dz == avoid_z) then
+          local ddx, ddz = nx - tx, nz - tz
+          local dist = ddx * ddx + ddz * ddz
+          if best_dist == nil or dist < best_dist then
+            best_dist = dist
+            best_dir  = d
+          end
+        end
+      end
+    end
+    return best_dir
+  end
+  return try_pick(false) or try_pick(true)
+end
+
+local function pick_random_neighbor(gi)
+  local g = ghosts[gi]
+  local last = g.last_dir
+  local avoid_x, avoid_z = -last[1], -last[2]
+  local valid = {}
+  for _, d in ipairs(DIRS_TIEBREAK) do
+    local nx, nz = g.tx + d[1], g.tz + d[2]
+    if in_bounds(nx, nz) and maze[nx + 1][nz + 1] ~= TILE_WALL
+       and not (d[1] == avoid_x and d[2] == avoid_z) then
+      valid[#valid + 1] = d
+    end
+  end
+  if #valid == 0 then
+    -- Cornered — allow reverse.
+    for _, d in ipairs(DIRS_TIEBREAK) do
+      local nx, nz = g.tx + d[1], g.tz + d[2]
+      if in_bounds(nx, nz) and maze[nx + 1][nz + 1] ~= TILE_WALL then
+        valid[#valid + 1] = d
+      end
+    end
+  end
+  if #valid == 0 then return nil end
+  local idx = (rng_step() % #valid) + 1
+  return valid[idx]
+end
+
+local function ghost_pick_dir(gi)
+  local g = ghosts[gi]
+  if g.mode == GM_NORMAL then
+    local tx, tz = target_for_ghost(gi)
+    return pick_best_toward(gi, tx, tz)
+  elseif g.mode == GM_EATEN then
+    return pick_best_toward(gi, g.spawn[1], g.spawn[2])
+  else
+    return pick_random_neighbor(gi)
+  end
+end
+
+-- Forward decls for mutual recursion (check_end ↔ soft_reset ↔ finalize_*).
+local check_end, soft_reset
+
+local function start_ghost_move(gi, dx, dz)
+  local g = ghosts[gi]
+  if not in_bounds(g.tx + dx, g.tz + dz) then return false end
+  if maze[g.tx + dx + 1][g.tz + dz + 1] == TILE_WALL then return false end
+  g.anim = {
+    src_tx = g.tx, src_tz = g.tz,
+    dx = dx, dz = dz, sub_step = 0, sub_frame = 0,
+  }
+  g.last_dir = { dx, dz }
+  return true
+end
+
+local function finalize_ghost_arrival(gi, t)
+  local g = ghosts[gi]
+  local a = g.anim
+  g.tx, g.tz, g.anim = a.src_tx + a.dx, a.src_tz + a.dz, nil
+
+  if g.mode == GM_EATEN and g.tx == g.spawn[1] and g.tz == g.spawn[2] then
+    g.mode = GM_NORMAL
+    return
+  end
+
+  check_end(t)
+  if game_state ~= STATE_PLAYING then return end
+
+  local d = ghost_pick_dir(gi)
+  if d then start_ghost_move(gi, d[1], d[2]) end
+end
+
+local function tick_ghost_anim(gi, t)
+  local g = ghosts[gi]
+  local a = g.anim
+  if not a then return end
+  local fpss = frames_per_sub_step_ghost(g.mode)
+  a.sub_frame = a.sub_frame + 1
+  if a.sub_frame < fpss then return end
+  a.sub_frame = 0
+  a.sub_step  = a.sub_step + 1
+  if a.sub_step >= SUB_STEPS then
+    finalize_ghost_arrival(gi, t)
+  end
+end
+
+local function finalize_player_arrival(t)
+  local a = player_anim
+  player_tx, player_tz = a.src_tx + a.dx, a.src_tz + a.dz
+  player_anim = nil
+
+  local tile = maze[player_tx + 1][player_tz + 1]
+  if tile == TILE_PELLET then
+    maze[player_tx + 1][player_tz + 1] = TILE_EMPTY
+    pellets_remaining = pellets_remaining - 1
+    score = score + 10
+  elseif tile == TILE_POWER then
+    maze[player_tx + 1][player_tz + 1] = TILE_EMPTY
+    pellets_remaining = pellets_remaining - 1
+    score = score + 50
+    trigger_frightened()
+  end
+
+  check_end(t)
+  if game_state ~= STATE_PLAYING then return end
+
+  local d = desired_dir
+  local c = player_dir
+  if (d[1] ~= 0 or d[2] ~= 0)
+     and not (d[1] == c[1] and d[2] == c[2])
+     and can_move_to(player_tx, player_tz, d[1], d[2]) then
+    start_player_move(d[1], d[2])
+  elseif (c[1] ~= 0 or c[2] ~= 0)
+     and can_move_to(player_tx, player_tz, c[1], c[2]) then
+    start_player_move(c[1], c[2])
+  end
+end
+
+local function tick_player_anim(t)
+  if not player_anim then return end
+  local a = player_anim
+  local fpss = frames_per_sub_step_player()
+  a.sub_frame = a.sub_frame + 1
+  if a.sub_frame < fpss then return end
+  a.sub_frame = 0
+  a.sub_step  = a.sub_step + 1
+  if a.sub_step >= SUB_STEPS then
+    finalize_player_arrival(t)
+  end
+end
+
+local function advance_phase()
+  local next_idx = phase_index + 1
+  if next_idx > #PHASE_SCHEDULE then next_idx = #PHASE_SCHEDULE end
+  phase_index = next_idx
+  phase       = PHASE_SCHEDULE[next_idx][1]
+  phase_timer = PHASE_SCHEDULE[next_idx][2]
+  for _, g in ipairs(ghosts) do
+    g.last_dir = { -g.last_dir[1], -g.last_dir[2] }
+  end
+end
+
+soft_reset = function(t)
+  player_tx   = MAZE_SIZE // 2
+  player_tz   = MAZE_SIZE // 2
+  player_dir  = { 0, 0 }
+  desired_dir = { 0, 0 }
+  player_anim = nil
+
+  for _, g in ipairs(ghosts) do
+    g.tx, g.tz   = g.spawn[1], g.spawn[2]
+    g.last_dir   = { 0, 0 }
+    g.mode       = GM_NORMAL
+    g.anim       = nil
+  end
+
+  frightened_timer = 0
+  ghost_chain      = 0
+  respawn_until    = t + RESPAWN_GRACE
+end
+
+check_end = function(t)
+  local lost_life = false
+  for gi = 1, #ghosts do
+    local g = ghosts[gi]
+    if g.tx == player_tx and g.tz == player_tz then
+      if g.mode == GM_NORMAL then
+        if lives > 0 then lives = lives - 1 end
+        if lives == 0 then
+          game_state = STATE_LOST
+          return
+        end
+        lost_life = true
+        break
+      elseif g.mode == GM_FRIGHTENED then
+        ghost_chain = math.min(ghost_chain + 1, 4)
+        local award = 200 << math.min(ghost_chain - 1, 3)
+        score = score + award
+        g.mode = GM_EATEN
+      end
+    end
+  end
+  if lost_life then
+    soft_reset(t)
+    return
+  end
+  if pellets_remaining == 0 then
+    game_state = STATE_WON
+  end
+end
+
+-- ---------- setup ----------------------------------------------------
+
+local function load_sprites()
+  spr_load(SPR_WALL,   4, solid_sprite(4, COLOR_WALL))
+  spr_load(SPR_POWER,  2, solid_sprite(2, COLOR_POWER))
+  spr_load(SPR_PLAYER, 4, solid_sprite(4, COLOR_PLAYER))
+  for i = 1, 4 do
+    spr_load(SPR_GHOST_BASE + (i - 1), 4, solid_sprite(4, COLOR_GHOST[i]))
+  end
+  spr_load(SPR_FRIGHT, 4, solid_sprite(4, COLOR_FRIGHT))
+  spr_load(SPR_EATEN,  4, solid_sprite(4, COLOR_EATEN))
+end
+
+local function setup_world()
+  score             = 0
+  lives             = LIVES_START
+  player_dir        = { 0, 0 }
+  desired_dir       = { 0, 0 }
+  player_anim       = nil
+  game_state        = STATE_PLAYING
+  phase_index       = 1
+  phase             = PHASE_SCHEDULE[1][1]
+  phase_timer       = PHASE_SCHEDULE[1][2]
+  frightened_timer  = 0
+  ghost_chain       = 0
+  respawn_until     = 0
+  announced_end     = false
+
+  maze = generate_maze()
+
+  pellets_remaining = 0
+  for tx = 0, MAZE_SIZE - 1 do
+    for tz = 0, MAZE_SIZE - 1 do
+      local t = maze[tx + 1][tz + 1]
+      if t == TILE_PELLET or t == TILE_POWER then
+        pellets_remaining = pellets_remaining + 1
+      end
+    end
+  end
+
+  player_tx = MAZE_SIZE // 2
+  player_tz = MAZE_SIZE // 2
+
+  local n = MAZE_SIZE
+  -- Corners (0-indexed): Blinky top-right, Pinky top-left, Inky bottom-right, Clyde bottom-left.
+  local corners   = { { n - 2, 1 }, { 1, 1 }, { n - 2, n - 2 }, { 1, n - 2 } }
+  local behaviors = { GB_BLINKY, GB_PINKY, GB_INKY, GB_CLYDE }
+  ghosts = {}
+  for i = 1, 4 do
+    ghosts[i] = {
+      tx          = corners[i][1],
+      tz          = corners[i][2],
+      last_dir    = { 0, 0 },
+      behavior    = behaviors[i],
+      mode        = GM_NORMAL,
+      home_corner = { corners[i][1], corners[i][2] },
+      spawn       = { corners[i][1], corners[i][2] },
+      anim        = nil,
+    }
+  end
+
+  print("Pellets: " .. pellets_remaining)
+end
+
+-- ---------- cart hooks ----------------------------------------------
+
+function init()
+  print("--- omnivixion: pacman v0 (Lua) ---")
+  print("WASD to move. Eat all pellets. Avoid the ghosts.")
+  cam_pitch(75.0)
+  load_sprites()
+  setup_world()
+  render_world()
+end
+
+function update(dt)
+  if game_state ~= STATE_PLAYING then
+    if not announced_end then
+      announced_end = true
+      if game_state == STATE_WON then
+        print("YOU WIN! Final score: " .. score)
+      else
+        print("Caught! Final score: " .. score)
+      end
+    end
+    if btnp(6) then setup_world() end
+    render_world()
+    return
+  end
+
+  local t = time()
+
+  -- Input → sticky desired_dir.
+  if     btn(3) then desired_dir = { 0, -1 }
+  elseif btn(2) then desired_dir = { 0, 1 }
+  elseif btn(0) then desired_dir = { -1, 0 }
+  elseif btn(1) then desired_dir = { 1, 0 }
+  end
+
+  if not player_anim then
+    local d = desired_dir
+    local c = player_dir
+    if (d[1] ~= 0 or d[2] ~= 0)
+       and can_move_to(player_tx, player_tz, d[1], d[2]) then
+      start_player_move(d[1], d[2])
+    elseif (c[1] ~= 0 or c[2] ~= 0)
+       and can_move_to(player_tx, player_tz, c[1], c[2]) then
+      start_player_move(c[1], c[2])
+    end
+  end
+
+  tick_player_anim(t)
+  if game_state ~= STATE_PLAYING then return end
+
+  if t >= INTRO_GRACE and t >= respawn_until then
+    for gi = 1, #ghosts do
+      if not ghosts[gi].anim then
+        local d = ghost_pick_dir(gi)
+        if d then start_ghost_move(gi, d[1], d[2]) end
+      end
+      tick_ghost_anim(gi, t)
+      if game_state ~= STATE_PLAYING then return end
+    end
+  end
+
+  if frightened_timer > 0 then
+    frightened_timer = frightened_timer - 1
+    if frightened_timer == 0 then
+      for _, g in ipairs(ghosts) do
+        if g.mode == GM_FRIGHTENED then g.mode = GM_NORMAL end
+      end
+      ghost_chain = 0
+    end
+  end
+
+  if frightened_timer == 0 and phase_timer ~= INDEFINITE then
+    if phase_timer > 0 then
+      phase_timer = phase_timer - 1
+      if phase_timer == 0 then advance_phase() end
+    end
+  end
+
+  render_world()
+end
