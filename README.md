@@ -43,7 +43,6 @@ The maze scatter→chase phases, four ghost personalities (Blinky / Pinky / Inky
   - `cart.rs` — `Cart` trait, `DemoCart`, `PacmanCart`.
   - `main.rs` — winit + camera + 60 Hz logic / vsynced render.
 - **`SPEC.md`** — the console spec, v0.1 draft.
-- **`web-prototype/`** — original TypeScript exploration. Kept around as reference; not part of the build.
 - **`Cargo.toml` / `Cargo.lock`** — single crate.
 
 ---
@@ -71,7 +70,7 @@ Because cubes are everywhere and constraint = creativity. The RD lattice has:
 - **No axis-aligned step.** Pure +X movement at lattice resolution doesn't exist; you either chain face-neighbor offsets that net to an axis (zigzag) or work at a coarser tile abstraction. Pacman's cart picks the latter for the maze grid and the former for inter-tile animation.
 - **Sphere-packing aesthetic.** FCC is the densest sphere packing; RDs are its Voronoi cells. Things look organic.
 
-The TypeScript web prototype tested both RD and the truncated-octahedral (BCC) alternative. RD won on aesthetic distinctiveness; the web prototype directory has both for reference.
+An early TypeScript prototype (since deleted from the tree) tested both RD and the truncated-octahedral (BCC) alternative. RD won on aesthetic distinctiveness.
 
 ---
 
