@@ -129,6 +129,13 @@ impl App {
         self.update_accum += dt;
         let mut steps = 0u32;
         while self.update_accum >= LOGIC_DT && steps < MAX_UPDATES_PER_FRAME {
+            // Default mode: clear the display buffer before each update so carts
+            // can render statelessly. Carts that opt into persistent buffers via
+            // `set_persist_buffer(true)` skip this and manage cleanup themselves.
+            if !self.console.persist_buffer {
+                use crate::console::CartApi;
+                self.console.vox_clear();
+            }
             self.cart.update(&mut self.console, LOGIC_DT);
             self.console.tick = self.console.tick.wrapping_add(1);
             // Clear edge-trigger pressed-this-frame state after each logic tick so

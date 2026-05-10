@@ -121,6 +121,11 @@ pub struct Console {
     filled_neighbors: Vec<u8>,
     /// Sprite bank, 256 slots. Each slot is `None` until `spr_load` is called.
     sprites: Vec<Option<Sprite>>,
+    /// When false (default), the emulator clears the display buffer before each
+    /// `cart.update()` call so the cart can render statelessly. Carts with
+    /// largely-static scenes (like the demo landscape) call `set_persist_buffer(true)`
+    /// in `init` to opt back into the old persistent-buffer behavior.
+    pub persist_buffer: bool,
     pub palette: [Rgb; 16],
 
     pub instances: Vec<Instance>,
@@ -143,6 +148,7 @@ impl Console {
             buffer: vec![0u8; BUFFER_BYTES],
             filled_neighbors: vec![0u8; VALID_CELLS],
             sprites,
+            persist_buffer: false,
             palette: DEFAULT_PALETTE,
             instances: Vec::with_capacity(1 << 18),
             cell_to_slot: HashMap::with_capacity(1 << 18),
@@ -251,6 +257,14 @@ pub trait CartApi {
     fn spr_draw(&mut self, id: u8, x: i32, y: i32, z: i32);
     /// Drop a sprite from the bank. After this, `spr_draw(id, ...)` is a no-op.
     fn spr_clear(&mut self, id: u8);
+
+    /// Toggle persistent-buffer mode. When `false` (default), the emulator
+    /// clears the display buffer at the start of every `update()` so the cart
+    /// can render statelessly. When `true`, the buffer carries between frames
+    /// and the cart is responsible for clearing what it wants gone.
+    fn set_persist_buffer(&mut self, persist: bool);
+    /// Read the current persistent-buffer flag.
+    fn persist_buffer(&self) -> bool;
 
     /// Stamp a string of glyphs in the default `XYWall` orientation
     /// (advance +X, glyph height +Y, z-snap for parity).
@@ -413,6 +427,13 @@ impl CartApi for Console {
 
     fn spr_clear(&mut self, id: u8) {
         self.sprites[id as usize] = None;
+    }
+
+    fn set_persist_buffer(&mut self, persist: bool) {
+        self.persist_buffer = persist;
+    }
+    fn persist_buffer(&self) -> bool {
+        self.persist_buffer
     }
 
     fn text_draw(&mut self, s: &str, x: i32, y: i32, z: i32, color: u8) {

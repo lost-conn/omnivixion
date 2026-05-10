@@ -61,8 +61,9 @@ Sweet spot for "cheap hardware" emulators. 525 KB framebuffer, ~52 K typical sur
 
 ## 6. Update model & syscall API
 
-- **Display buffer is persistent.** Frame N's cells carry into frame N+1 unless overwritten. Carts opt into clearing.
-- **No automatic redraw.** The cart is the renderer. The emulator just shows what's in the buffer.
+- **Default: full-refresh display.** The emulator clears the display buffer at the start of every `update()` tick. Carts redraw the full visible scene each tick — no manual cell cleanup, no surprise leftover voxels. Hobbyist-friendly default; matches the mental model of "render this frame."
+- **Opt-in: persistent buffer.** A cart can call `set_persist_buffer(true)` (typically in `init()`) to keep the buffer across ticks. Best for largely-static scenes where re-stamping every cell each frame is wasteful (e.g. open-world landscapes with hundreds of thousands of cells).
+- **No automatic redraw beyond the per-tick clear.** The cart is the renderer. The emulator just shows what's in the buffer.
 - **Frame rate:** 30 Hz default, 60 Hz opt-in via cart header flag. Emulator runs the cart's `update()` once per tick.
 
 ### Core syscalls (v0.1)
@@ -80,6 +81,11 @@ neighbor(x, y, z, idx) -> (x', y', z')   -- idx 0..11, returns face-neighbor.
 
 pal_set(slot, r, g, b)          -- override palette entry. slot in 1..15.
 pal_reset()                     -- restore default palette.
+
+set_persist_buffer(persist)     -- false (default): emulator clears the buffer
+                                --   each tick before update().
+                                -- true: persistent buffer; cart manages cleanup.
+persist_buffer() -> bool        -- read current mode.
 
 cam_pitch(deg)                  -- set camera pitch in [0, 90]. Out-of-range clamped.
 cam_pitch_get() -> deg          -- read current pitch.

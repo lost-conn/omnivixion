@@ -56,6 +56,9 @@ fn demo_color_for_elevation(y: i32, top: i32) -> u8 {
 impl Cart for DemoCart {
     fn init(&mut self, api: &mut dyn CartApi) {
         api.print("Generating world...");
+        // The landscape is ~250K cells of essentially-static terrain — far too
+        // many to redraw every frame. Keep the persistent buffer.
+        api.set_persist_buffer(true);
         let n = 128i32;
         for x in 0..n {
             for z in 0..n {
@@ -344,10 +347,9 @@ pub struct PacmanCart {
     ghost_chain: u8,
     /// Tick threshold below which ghosts hold still after a respawn.
     respawn_until: u64,
-    /// Last values we drew into the HUD; we only restamp on change.
-    last_drawn_score: Option<u32>,
-    last_drawn_lives: Option<u8>,
     rng: u64,
+    /// True once we've printed the end-state line to the console — kept so the
+    /// stdout log gets one notice per game-over rather than one per frame.
     announced_end: bool,
 }
 
@@ -371,8 +373,6 @@ impl PacmanCart {
             frightened_timer: 0,
             ghost_chain: 0,
             respawn_until: 0,
-            last_drawn_score: None,
-            last_drawn_lives: None,
             rng: 0xDEAD_BEEF_CAFE_BABE,
             announced_end: false,
         }
@@ -471,32 +471,11 @@ impl PacmanCart {
         api.text_draw_axis(s, HUD_X, HUD_Y, anchor_z, color, TextOrient::XZFloor);
     }
 
-    fn redraw_hud_if_dirty(&mut self, api: &mut dyn CartApi) {
-        if self.last_drawn_score != Some(self.score) {
-            if self.last_drawn_score.is_none() {
-                Self::draw_hud_line(api, HUD_Z_BASE, "SCORE", COLOR_PELLET);
-            }
-            Self::draw_hud_line(api, HUD_Z_BASE + 8, &format!("{:05}", self.score), COLOR_PELLET);
-            self.last_drawn_score = Some(self.score);
-        }
-        if self.last_drawn_lives != Some(self.lives) {
-            if self.last_drawn_lives.is_none() {
-                Self::draw_hud_line(api, HUD_Z_BASE + 16, "LIVES", COLOR_PLAYER);
-            }
-            Self::draw_hud_line(api, HUD_Z_BASE + 24, &format!("{}", self.lives), COLOR_PLAYER);
-            self.last_drawn_lives = Some(self.lives);
-        }
-    }
-
     /// Move player + all ghosts back to their spawn tiles, drop any in-flight
     /// Frightened/Eaten state, and start a brief grace window before ghosts move
-    /// again. Pellets and score persist.
-    fn soft_reset(&mut self, t: u64, api: &mut dyn CartApi) {
-        // Clear at the entity's current visual anchor (which may be mid-anim).
-        let (px, py, pz) = self.player_anchor();
-        Self::clear_entity_box(px, py, pz, api);
-        self.stamp_tile(self.player_tx, self.player_tz, api);
-
+    /// again. Pellets and score persist. Pure state update — visuals come from
+    /// the next `render_world` pass.
+    fn soft_reset(&mut self, t: u64, _api: &mut dyn CartApi) {
         self.player_tx = MAZE_SIZE / 2;
         self.player_tz = MAZE_SIZE / 2;
         self.player_dir = (0, 0);
@@ -504,10 +483,6 @@ impl PacmanCart {
         self.player_anim = None;
 
         for gi in 0..self.ghosts.len() {
-            let (gx, gy, gz) = self.ghost_anchor(gi);
-            Self::clear_entity_box(gx, gy, gz, api);
-            self.stamp_tile(self.ghosts[gi].tx, self.ghosts[gi].tz, api);
-
             let g = &mut self.ghosts[gi];
             g.tx = g.spawn.0;
             g.tz = g.spawn.1;
@@ -519,20 +494,6 @@ impl PacmanCart {
         self.frightened_timer = 0;
         self.ghost_chain = 0;
         self.respawn_until = t + RESPAWN_GRACE;
-
-        // Re-render player and ghosts at their fresh positions.
-        self.render_player(api);
-        for gi in 0..self.ghosts.len() {
-            self.render_ghost(gi, api);
-        }
-    }
-
-    fn render_static_world(&self, api: &mut dyn CartApi) {
-        for tx in 0..MAZE_SIZE {
-            for tz in 0..MAZE_SIZE {
-                self.stamp_tile(tx, tz, api);
-            }
-        }
     }
 
     fn player_anchor(&self) -> (i32, i32, i32) {
@@ -641,62 +602,39 @@ impl PacmanCart {
         // else: stop. player_anim stays None.
     }
 
-    /// Advance the player's animation by one frame.
+    /// Advance the player's animation by one frame. Pure state update — the
+    /// frame's visuals are produced by `render_world` at the end of `update`.
     fn tick_player_anim(&mut self, t: u64, api: &mut dyn CartApi) {
         let Some(mut anim) = self.player_anim else { return };
         let fpss = self.frames_per_sub_step_player();
         anim.sub_frame += 1;
         if anim.sub_frame < fpss {
-            // Still inside this sub-step — no visual update needed.
             self.player_anim = Some(anim);
             return;
         }
-        // Sub-step boundary reached. Tear down the previous render and either
-        // render at the next sub-step position or finalize the move.
-        let prev = Self::anim_anchor(&anim);
-        Self::clear_entity_box(prev.0, prev.1, prev.2, api);
-        // Stamp source tile (now vacated) and the imminent destination tile so
-        // their static contents (pellets, walls) re-render under the entity.
-        self.stamp_tile(anim.src_tx, anim.src_tz, api);
-        let dst_tx = anim.src_tx + anim.dir.0;
-        let dst_tz = anim.src_tz + anim.dir.1;
-        if in_bounds(dst_tx, dst_tz) {
-            self.stamp_tile(dst_tx, dst_tz, api);
-        }
-
         anim.sub_frame = 0;
         anim.sub_step += 1;
-
         if anim.sub_step >= SUB_STEPS {
-            // Arrived at the destination tile — write back, eat pellets, etc.
             self.player_anim = Some(anim);
             self.finalize_player_arrival(t, api);
-            // Whether or not a fresh anim was started, the player needs to be
-            // drawn on top of any underlying tile content.
-            self.render_player(api);
             return;
         }
-
         self.player_anim = Some(anim);
-        self.render_player(api);
     }
 
     /// Flip every Normal-mode ghost into Frightened, restart the chain counter,
     /// and pause the scatter/chase clock for FRIGHT_DURATION frames.
-    fn trigger_frightened(&mut self, api: &mut dyn CartApi) {
+    fn trigger_frightened(&mut self, _api: &mut dyn CartApi) {
         self.frightened_timer = FRIGHT_DURATION;
         self.ghost_chain = 0;
         for gi in 0..self.ghosts.len() {
             if self.ghosts[gi].mode == GhostMode::Normal {
                 self.ghosts[gi].mode = GhostMode::Frightened;
-                // Reverse direction (classic). If mid-anim, also flip the anim.
+                // Reverse direction (classic) and abandon any in-flight move so
+                // the ghost re-orients on its next AI tick.
                 let (dx, dz) = self.ghosts[gi].last_dir;
                 self.ghosts[gi].last_dir = (-dx, -dz);
                 self.ghosts[gi].anim = None;
-                let (gx, gy, gz) = self.ghost_anchor(gi);
-                Self::clear_entity_box(gx, gy, gz, api);
-                self.stamp_tile(self.ghosts[gi].tx, self.ghosts[gi].tz, api);
-                self.render_ghost(gi, api);
             }
         }
     }
@@ -893,28 +831,14 @@ impl PacmanCart {
             self.ghosts[gi].anim = Some(anim);
             return;
         }
-
-        let prev = Self::anim_anchor(&anim);
-        Self::clear_entity_box(prev.0, prev.1, prev.2, api);
-        self.stamp_tile(anim.src_tx, anim.src_tz, api);
-        let dst_tx = anim.src_tx + anim.dir.0;
-        let dst_tz = anim.src_tz + anim.dir.1;
-        if in_bounds(dst_tx, dst_tz) {
-            self.stamp_tile(dst_tx, dst_tz, api);
-        }
-
         anim.sub_frame = 0;
         anim.sub_step += 1;
-
         if anim.sub_step >= SUB_STEPS {
             self.ghosts[gi].anim = Some(anim);
             self.finalize_ghost_arrival(gi, t, api);
-            self.render_ghost(gi, api);
             return;
         }
-
         self.ghosts[gi].anim = Some(anim);
-        self.render_ghost(gi, api);
     }
 
     fn advance_phase(&mut self) {
@@ -977,26 +901,66 @@ impl PacmanCart {
         }
     }
 
-    fn flood_end_state(&mut self, api: &mut dyn CartApi) {
-        // Recolor all non-wall tiles to a single fill color. Walls keep their
-        // structure; floor blocks become the flood color via vox_fill so the
-        // whole 4³ block recolors uniformly.
-        let fill = match self.state {
-            GameState::Won => COLOR_PELLET, // pellet-yellow celebration
-            GameState::Lost => 13,          // red
-            GameState::Playing => return,
-        };
-        for tx in 0..MAZE_SIZE {
-            for tz in 0..MAZE_SIZE {
-                if self.maze[tx as usize][tz as usize] == Tile::Wall {
-                    continue;
+    /// Stamp every visible cell for the current frame. Called at the end of
+    /// `update` after the auto-clear at the start of the next tick wipes the
+    /// buffer. With auto-clear-then-redraw, intermediate gymnastics aren't
+    /// needed — the buffer is exactly what we draw here.
+    fn render_world(&mut self, api: &mut dyn CartApi) {
+        // Maze
+        if self.state == GameState::Playing {
+            for tx in 0..MAZE_SIZE {
+                for tz in 0..MAZE_SIZE {
+                    self.stamp_tile(tx, tz, api);
                 }
-                let (x, z) = Self::tile_to_world(tx, tz);
-                api.vox_fill(x, GAME_Y, z, x + 3, GAME_Y + 3, z + 3, fill);
+            }
+        } else {
+            // End-state: walls stay; non-wall tiles flood with a celebration /
+            // condolence color.
+            let fill = match self.state {
+                GameState::Won => COLOR_PELLET, // pellet-yellow celebration
+                GameState::Lost => 13,          // red
+                GameState::Playing => unreachable!(),
+            };
+            for tx in 0..MAZE_SIZE {
+                for tz in 0..MAZE_SIZE {
+                    let (ax, az) = Self::tile_to_world(tx, tz);
+                    if self.maze[tx as usize][tz as usize] == Tile::Wall {
+                        api.spr_draw(SPR_WALL, ax, GAME_Y, az);
+                    } else {
+                        api.vox_fill(ax, GAME_Y, az, ax + 3, GAME_Y + 3, az + 3, fill);
+                    }
+                }
             }
         }
-        // Always keep player visible on top.
+
+        // Title (in-game or end-state).
+        match self.state {
+            GameState::Playing => Self::draw_title(api, "Pacman v0.1!", COLOR_PELLET),
+            GameState::Won => {
+                Self::draw_title(api, "WIN!", COLOR_PELLET);
+                Self::draw_restart_prompt(api);
+            }
+            GameState::Lost => {
+                Self::draw_title(api, "LOST", 13);
+                Self::draw_restart_prompt(api);
+            }
+        }
+
+        // HUD (always visible, including on end-state).
+        Self::draw_hud_line(api, HUD_Z_BASE, "SCORE", COLOR_PELLET);
+        Self::draw_hud_line(
+            api, HUD_Z_BASE + 8, &format!("{:05}", self.score), COLOR_PELLET,
+        );
+        Self::draw_hud_line(api, HUD_Z_BASE + 16, "LIVES", COLOR_PLAYER);
+        Self::draw_hud_line(
+            api, HUD_Z_BASE + 24, &format!("{}", self.lives), COLOR_PLAYER,
+        );
+
+        // Entities last, so they sit on top of any tile content.
         self.render_player(api);
+        for gi in 0..self.ghosts.len() {
+            self.render_ghost(gi, api);
+        }
     }
 }
 
@@ -1079,8 +1043,6 @@ impl PacmanCart {
         self.frightened_timer = 0;
         self.ghost_chain = 0;
         self.respawn_until = 0;
-        self.last_drawn_score = None;
-        self.last_drawn_lives = None;
         self.announced_end = false;
 
         self.maze = generate_maze();
@@ -1132,25 +1094,16 @@ impl PacmanCart {
             })
             .collect();
 
-        self.render_static_world(api);
-        self.render_player(api);
-        for gi in 0..self.ghosts.len() {
-            self.render_ghost(gi, api);
-        }
-
-        // Title text floating above the maze.
-        Self::draw_title(api, "Pacman v0.1!", COLOR_PELLET);
-
-        // Initial HUD stamp.
-        self.redraw_hud_if_dirty(api);
+        // No rendering here — render_world at the end of each update
+        // tick produces the visible frame.
 
         api.print(&format!("Pellets: {}", self.pellets_remaining));
     }
 
-    /// Wipe the display buffer and re-run setup_world. Called when the player
-    /// presses Z on the game-over screen.
+    /// Reset cart state for a new run. With auto-clear there's no need to
+    /// vox_clear ourselves — the next update tick will start with an empty
+    /// buffer.
     fn restart_game(&mut self, api: &mut dyn CartApi) {
-        api.vox_clear();
         self.setup_world(api);
     }
 
@@ -1178,6 +1131,9 @@ impl Cart for PacmanCart {
         api.cam_pitch(75.0);
         Self::load_sprites(api);
         self.setup_world(api);
+        // Render once so the emulator's post-init auto-fit can size the camera
+        // around the populated region.
+        self.render_world(api);
     }
 
     fn update(&mut self, api: &mut dyn CartApi, _dt: f32) {
@@ -1186,27 +1142,18 @@ impl Cart for PacmanCart {
                 self.announced_end = true;
                 let final_score = self.score;
                 match self.state {
-                    GameState::Won => {
-                        api.print(&format!("YOU WIN! Final score: {}", final_score));
-                        Self::draw_title(api, "WIN!", COLOR_PELLET);
-                    }
-                    GameState::Lost => {
-                        api.print(&format!("Caught! Final score: {}", final_score));
-                        Self::draw_title(api, "LOST", 13);
-                    }
+                    GameState::Won => api.print(&format!("YOU WIN! Final score: {}", final_score)),
+                    GameState::Lost => api.print(&format!("Caught! Final score: {}", final_score)),
                     GameState::Playing => {}
                 }
-                self.flood_end_state(api);
-                Self::draw_restart_prompt(api);
-                // The HUD may still show pre-collision values (e.g. LIVES 1
-                // when state flipped to Lost on the same tick); flush it.
-                self.redraw_hud_if_dirty(api);
             }
-            // Wait for the restart input — Z (action A) wipes everything and
-            // calls setup_world for a fresh run.
+            // Wait for the restart input — Z (action A) flips state and
+            // setup_world re-initializes everything for a fresh run.
             if api.btnp(6) {
                 self.restart_game(api);
             }
+            // End-state visuals come from render_world below.
+            self.render_world(api);
             return;
         }
 
@@ -1264,16 +1211,13 @@ impl Cart for PacmanCart {
         }
 
         // Frightened countdown — when it hits zero, all Frightened ghosts revert
-        // to Normal in place and the phase timer resumes.
+        // to Normal mode (rendering picks that up automatically next frame).
         if self.frightened_timer > 0 {
             self.frightened_timer -= 1;
             if self.frightened_timer == 0 {
                 for gi in 0..self.ghosts.len() {
                     if self.ghosts[gi].mode == GhostMode::Frightened {
                         self.ghosts[gi].mode = GhostMode::Normal;
-                        let (gx, gy, gz) = self.ghost_anchor(gi);
-                        Self::clear_entity_box(gx, gy, gz, api);
-                        self.render_ghost(gi, api);
                     }
                 }
                 self.ghost_chain = 0;
@@ -1288,7 +1232,7 @@ impl Cart for PacmanCart {
             }
         }
 
-        // Repaint the HUD when score / lives change.
-        self.redraw_hud_if_dirty(api);
+        // Stamp the entire frame.
+        self.render_world(api);
     }
 }
