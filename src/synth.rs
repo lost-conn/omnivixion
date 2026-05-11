@@ -8,10 +8,10 @@
 //! - 4 polyphonic voices
 //! - 8 base waveforms (SPEC §9.2)
 //! - SFX step engine with per-SFX speed + loop metadata (SPEC §9.4)
+//! - Per-step effects 0..7 (SPEC §9.3)
 //! - sfx/audio_master command surface
 //!
 //! Not yet implemented (later phases):
-//! - Effects (slide, vibrato, drop, fades, arpeggios — SPEC §9.3)
 //! - Custom instruments (waveform values 8..15 — SPEC §9.2 last paragraph)
 //! - Music sequencer / pattern chaining (SPEC §9.5)
 
@@ -179,6 +179,14 @@ struct Voice {
     waveform: u8,
     volume: f32,
     effect: u8,
+    // Slide source (previous step's pitch); equals pitch_hz on the first step.
+    prev_pitch_hz: f32,
+    // Ring of the last 4 step pitches for arp effects; newest at recent_idx-1.
+    recent_pitches: [f32; 4],
+    recent_idx: u8,
+    // Effective pitch this sample (after slide/vibrato/drop/arp); fed back to
+    // advance_voice so phase increment matches the audible pitch.
+    eff_pitch_hz: f32,
 }
 
 struct State {
@@ -252,13 +260,17 @@ impl State {
             return;
         };
         let v = &mut self.voices[voice_idx];
+        *v = Voice::default();
         v.active = true;
         v.sfx_id = n;
         v.step_idx = offset.min((SFX_STEPS - 1) as u8);
-        v.samples_in_step = 0;
-        v.phase = 0.0;
         v.samples_per_step = step_samples(sfx.speed, self.sample_rate);
         load_step(&sfx, v.step_idx, v);
+        // First step has no real predecessor — slide-from is the step itself.
+        v.prev_pitch_hz = v.pitch_hz;
+        v.eff_pitch_hz = v.pitch_hz;
+        v.recent_pitches = [v.pitch_hz; 4];
+        v.recent_idx = 1;
     }
 
     fn render_f32(&mut self, output: &mut [f32]) {
@@ -295,9 +307,12 @@ impl State {
     }
 
     fn synth_voice(&mut self, vi: usize) -> f32 {
-        let (phase, waveform, volume) = {
-            let v = &self.voices[vi];
-            (v.phase, v.waveform, v.volume)
+        let sample_rate = self.sample_rate;
+        let (phase, waveform, eff_vol) = {
+            let v = &mut self.voices[vi];
+            let (p, vol) = apply_effect(v, sample_rate);
+            v.eff_pitch_hz = p;
+            (v.phase, v.waveform, vol)
         };
         let wave = match waveform.min(7) {
             0 => triangle(phase),
@@ -310,7 +325,7 @@ impl State {
             7 => phaser(phase),
             _ => 0.0,
         };
-        wave * volume
+        wave * eff_vol
     }
 
     fn noise(&mut self) -> f32 {
@@ -325,7 +340,7 @@ impl State {
     fn advance_voice(&mut self, vi: usize) {
         let (sfx_id, sample_rate) = {
             let v = &mut self.voices[vi];
-            let phase_inc = v.pitch_hz / self.sample_rate;
+            let phase_inc = v.eff_pitch_hz / self.sample_rate;
             v.phase = (v.phase + phase_inc).fract();
             v.samples_in_step += 1;
             (v.sfx_id, self.sample_rate)
@@ -340,6 +355,7 @@ impl State {
         let sfx = self.sfx_bank[sfx_id];
         let v = &mut self.voices[vi];
         v.samples_in_step = 0;
+        let prev_pitch = v.pitch_hz;
         let next = v.step_idx as usize + 1;
         let has_loop = sfx.loop_end > sfx.loop_start;
         if has_loop && next > sfx.loop_end as usize {
@@ -351,6 +367,9 @@ impl State {
             v.step_idx = next as u8;
         }
         load_step(&sfx, v.step_idx, v);
+        v.prev_pitch_hz = prev_pitch;
+        v.recent_pitches[v.recent_idx as usize % 4] = v.pitch_hz;
+        v.recent_idx = (v.recent_idx + 1) & 3;
         v.samples_per_step = step_samples(sfx.speed, sample_rate);
     }
 }
@@ -380,6 +399,40 @@ fn load_step(sfx: &Sfx, step_idx: u8, v: &mut Voice) {
     v.waveform = waveform;
     v.volume = volume as f32 / 7.0;
     v.effect = effect;
+}
+
+// ---------------------------------------------------------------------------
+//  Per-step effects (SPEC §9.3). Returns the (pitch_hz, volume) for this
+//  sample. The pitch result is also stored on the voice for advance_voice.
+// ---------------------------------------------------------------------------
+
+const VIBRATO_HZ: f32 = 6.0;
+const VIBRATO_SEMITONES: f32 = 0.5;
+const ARP_FAST_TICKS: f32 = 4.0;
+const ARP_SLOW_TICKS: f32 = 16.0;
+
+fn apply_effect(v: &Voice, sample_rate: f32) -> (f32, f32) {
+    let frac = v.samples_in_step as f32 / v.samples_per_step.max(1) as f32;
+    match v.effect {
+        1 => (v.prev_pitch_hz + (v.pitch_hz - v.prev_pitch_hz) * frac, v.volume),
+        2 => {
+            let t = v.samples_in_step as f32 / sample_rate;
+            let lfo = (2.0 * std::f32::consts::PI * VIBRATO_HZ * t).sin();
+            let mult = 2.0_f32.powf(VIBRATO_SEMITONES * lfo / 12.0);
+            (v.pitch_hz * mult, v.volume)
+        }
+        3 => (v.pitch_hz * (1.0 - 0.5 * frac), v.volume),
+        4 => (v.pitch_hz, v.volume * frac),
+        5 => (v.pitch_hz, v.volume * (1.0 - frac)),
+        6 | 7 => {
+            let ticks = if v.effect == 6 { ARP_FAST_TICKS } else { ARP_SLOW_TICKS };
+            let samples_per_slot = (ticks / ENGINE_HZ) * sample_rate;
+            let slot = ((v.samples_in_step as f32 / samples_per_slot) as usize) & 3;
+            let newest = v.recent_idx.wrapping_sub(1) as usize & 3;
+            (v.recent_pitches[(newest + 4 - slot) & 3], v.volume)
+        }
+        _ => (v.pitch_hz, v.volume),
+    }
 }
 
 // ---------------------------------------------------------------------------

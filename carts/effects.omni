@@ -1,0 +1,117 @@
+omnivixion cart v0.1
+
+__header__
+[meta]
+spec   = "0.1"
+name   = "Effects"
+author = "seth"
+desc   = "audio per-step effects demo — 8 SFX, one per effect 0..7"
+
+[runtime]
+lang = "lua"
+hz   = 60
+
+[display]
+default_pitch  = 30
+persist_buffer = false
+
+__sfx__
+# SFX 0 — effect 0 (none). Plain C-E-G-C scale on square. Sanity check.
+sfx 00 sanity
+  speed=8 loop=0..3
+  60e8 70e8 7ce8 90e8 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 1 — effect 1 (slide). C4 and C5 alternating, each step slides from
+# the previous. Loops indefinitely so the slide cycle is audible.
+sfx 01 slide
+  speed=16 loop=0..1
+  60e9 90e9 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 2 — effect 2 (vibrato). Sustained C5 on triangle. The wobble should
+# be clearly periodic.
+sfx 02 vibrato
+  speed=24 loop=0..1
+  902a 902a 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 3 — effect 3 (drop). One-shot saw at C6 falling an octave.
+sfx 03 drop
+  speed=24 loop=none
+  c0ab 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 4 — effect 4 (fade-in). Pulse at C5, vol ramps from 0 → 7.
+sfx 04 fadein
+  speed=24 loop=0..1
+  913c 913c 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 5 — effect 5 (fade-out). Pulse at C5, vol ramps from 7 → 0.
+sfx 05 fadeout
+  speed=24 loop=0..1
+  913d 913d 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 6 — effect 6 (arp-fast). Steps 0..3 prime the recent-pitches ring
+# (C4 E4 G4 C5, no effect), then steps 4..23 hold with arp-fast: the synth
+# cycles through the 4 primed pitches at ~4-tick rate.
+sfx 06 arpfast
+  speed=8 loop=4..23
+  6028 7028 7c28 9028 602e 602e 602e 602e
+  602e 602e 602e 602e 602e 602e 602e 602e
+  602e 602e 602e 602e 602e 602e 602e 602e
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 7 — effect 7 (arp-slow). Same priming as SFX 6, then arp at ~16-tick
+# rate.
+sfx 07 arpslow
+  speed=8 loop=4..23
+  6028 7028 7c28 9028 602f 602f 602f 602f
+  602f 602f 602f 602f 602f 602f 602f 602f
+  602f 602f 602f 602f 602f 602f 602f 602f
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+__lua__
+-- Effects demo: press one of the input buttons to trigger the matching SFX.
+-- Buttons map to effects 0..7 in order; see SPEC §7 for keymap.
+--
+--   btnp(0) = left   (A)         -> sfx 0  effect 0 (none, sanity)
+--   btnp(1) = right  (D)         -> sfx 1  effect 1 (slide)
+--   btnp(2) = down   (S)         -> sfx 2  effect 2 (vibrato)
+--   btnp(3) = up     (W)         -> sfx 3  effect 3 (drop)
+--   btnp(4) = descend (Shift)    -> sfx 4  effect 4 (fade-in)
+--   btnp(5) = ascend  (Space)    -> sfx 5  effect 5 (fade-out)
+--   btnp(6) = A       (Z)        -> sfx 6  effect 6 (arp-fast)
+--   btnp(7) = B       (X)        -> sfx 7  effect 7 (arp-slow)
+
+function init()
+  print("effects demo: A/D/S/W/Shift/Space/Z/X -> sfx 0..7")
+  -- Eight bright cells in a row so the window has something to show and
+  -- you can see at a glance which effect index you're poking.
+  for i = 0, 7 do
+    vox_set(56 + i * 2, 32, 64, 9 + (i % 6))
+  end
+end
+
+function update(dt)
+  for i = 0, 7 do
+    if btnp(i) then
+      print("sfx " .. i)
+      sfx(i)
+    end
+  end
+end
