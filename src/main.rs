@@ -4,6 +4,7 @@ mod font;
 mod lattice;
 mod loader;
 mod render;
+mod synth;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use cart::Cart;
 use console::Console;
 use lattice::N;
 use render::Renderer;
+use synth::Synth;
 
 struct CameraOrbit {
     target: Vec3,
@@ -66,6 +68,7 @@ struct App {
     last_frame: Instant,
     cart_inited: bool,
     update_accum: f32,
+    _synth: Option<Synth>,
 }
 
 const LOGIC_HZ: f32 = 60.0;
@@ -74,15 +77,27 @@ const MAX_UPDATES_PER_FRAME: u32 = 5; // avoid spiral of death after long stalls
 
 impl App {
     fn new(cart: Box<dyn Cart>) -> Self {
+        let synth = match Synth::try_open() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[audio] disabled: {e:#}");
+                None
+            }
+        };
+        let mut console = Console::new();
+        if let Some(s) = &synth {
+            console.set_audio_tx(s.tx.clone());
+        }
         Self {
             window: None,
             renderer: None,
-            console: Console::new(),
+            console,
             cart,
             orbit: CameraOrbit::new(),
             last_frame: Instant::now(),
             cart_inited: false,
             update_accum: 0.0,
+            _synth: synth,
         }
     }
 

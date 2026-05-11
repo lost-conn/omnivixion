@@ -1,0 +1,44 @@
+omnivixion cart v0.1
+
+__header__
+[meta]
+spec   = "0.1"
+name   = "Beep"
+author = "seth"
+desc   = "audio smoke test — one short square-wave tone at startup"
+
+[runtime]
+lang = "lua"
+hz   = 60
+
+[display]
+default_pitch  = 30
+persist_buffer = false
+
+__sfx__
+# One ascending tone, then silence — proves SFX bank parsing + voice
+# step engine + waveform synth end-to-end.
+sfx 00 chirp
+  speed=8 loop=0..7
+  30f8 34f8 38f8 3cf8 40f8 44f8 48f8 4cf8
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+__lua__
+-- Beep cart: trigger sfx 0 once at init, draw a small marker voxel so the
+-- window isn't empty. Press Z (button 6) to retrigger the chirp.
+
+function init()
+  print("beep cart: playing sfx 0")
+  sfx(0)
+  -- A single bright cell at center so the renderer has something to show.
+  vox_set(64, 32, 64, 11)
+end
+
+function update(dt)
+  if btnp(6) then
+    print("chirp")
+    sfx(0)
+  end
+end

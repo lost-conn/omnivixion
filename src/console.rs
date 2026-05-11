@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use winit::keyboard::KeyCode;
 
 use crate::lattice::{cell_index, is_valid, NEIGHBOR_OFFSETS, N, VALID_CELLS};
+use crate::synth::{AudioCmd, AudioCmdTx, Pattern, Sfx, MUSIC_COUNT, SFX_COUNT};
 
 /// Display-buffer byte count: 4 bits per cell, 2 cells per byte.
 const BUFFER_BYTES: usize = VALID_CELLS / 2;
@@ -138,6 +139,8 @@ pub struct Console {
     pub keys_pressed: HashSet<KeyCode>,
     pub tick: u64,
     rng_state: u64,
+
+    audio_tx: Option<AudioCmdTx>,
 }
 
 impl Console {
@@ -159,6 +162,22 @@ impl Console {
             keys_pressed: HashSet::new(),
             tick: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15,
+            audio_tx: None,
+        }
+    }
+
+    /// Plug in the audio command channel. Called once at startup by `main` if
+    /// the audio backend opened successfully. If never called, sfx/music/audio_master
+    /// calls are silent no-ops.
+    pub fn set_audio_tx(&mut self, tx: AudioCmdTx) {
+        self.audio_tx = Some(tx);
+    }
+
+    fn audio_send(&self, cmd: AudioCmd) {
+        if let Some(tx) = &self.audio_tx {
+            // Channel send failure means the audio thread died; we degrade
+            // gracefully (silent) rather than crashing the emulator.
+            let _ = tx.send(cmd);
         }
     }
 
@@ -285,6 +304,27 @@ pub trait CartApi {
     fn time(&self) -> u64;
     fn rand(&mut self) -> f32;
     fn print(&self, msg: &str);
+
+    // -- audio (SPEC §9) ----------------------------------------------------
+
+    /// Play SFX `n` on channel `ch`. `ch < 0` selects the first free voice.
+    /// `n < 0` stops the targeted channel (or all channels if ch < 0).
+    /// `offset` is the starting step index 0..31.
+    fn sfx(&mut self, n: i32, ch: i32, offset: i32);
+    /// Start the song beginning at pattern `n` (SPEC §9.5). `fade_ms` cross-fades
+    /// from current music. `ch_mask` reserves channels (bits 0..3) for music;
+    /// channels with their bit unset stay available to `sfx()`. `n < 0` stops.
+    fn music(&mut self, n: i32, fade_ms: u32, ch_mask: u8);
+    /// Global linear gain in 0..1. Default 1.
+    fn audio_master(&mut self, vol: f32);
+
+    /// Engine-internal: install the parsed SFX bank. Called once at cart init
+    /// from the loader. NOT exposed to Lua (banks are read-only at runtime
+    /// per SPEC §9.7).
+    fn load_sfx_bank(&mut self, bank: Box<[Sfx; SFX_COUNT]>);
+    /// Engine-internal: install the parsed music (pattern) bank. NOT exposed
+    /// to Lua.
+    fn load_music_bank(&mut self, bank: Box<[Pattern; MUSIC_COUNT]>);
 }
 
 fn btn_keys(idx: u8) -> &'static [KeyCode] {
@@ -537,5 +577,44 @@ impl CartApi for Console {
     }
     fn print(&self, msg: &str) {
         println!("[cart] {msg}");
+    }
+
+    fn sfx(&mut self, n: i32, ch: i32, offset: i32) {
+        if n < 0 {
+            if ch < 0 {
+                self.audio_send(AudioCmd::StopAll);
+            } else if (0..4).contains(&ch) {
+                self.audio_send(AudioCmd::StopChannel { ch: ch as u8 });
+            }
+            return;
+        }
+        if !(0..SFX_COUNT as i32).contains(&n) {
+            return;
+        }
+        let ch_i8 = ch.clamp(-1, 3) as i8;
+        let offset_u8 = offset.clamp(0, 31) as u8;
+        self.audio_send(AudioCmd::PlaySfx {
+            n: n as u8,
+            ch: ch_i8,
+            offset: offset_u8,
+        });
+    }
+
+    fn music(&mut self, _n: i32, _fade_ms: u32, _ch_mask: u8) {
+        // Music sequencer lands in a later phase. Lua binding is wired so carts
+        // can call music() without an undefined-global error; the call is a
+        // no-op until the sequencer is in.
+    }
+
+    fn audio_master(&mut self, vol: f32) {
+        self.audio_send(AudioCmd::SetMaster(vol));
+    }
+
+    fn load_sfx_bank(&mut self, bank: Box<[Sfx; SFX_COUNT]>) {
+        self.audio_send(AudioCmd::LoadSfxBank(bank));
+    }
+
+    fn load_music_bank(&mut self, bank: Box<[Pattern; MUSIC_COUNT]>) {
+        self.audio_send(AudioCmd::LoadMusicBank(bank));
     }
 }

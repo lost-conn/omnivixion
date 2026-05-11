@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::cart::Cart;
 use crate::console::{CartApi, TextOrient};
+use crate::synth::{Pattern, Sfx, MUSIC_COUNT, SFX_COUNT, SFX_STEPS};
 
 const FORMAT_MAJOR: u32 = 0;
 const MAX_CART_BYTES: usize = 4 * 1024 * 1024;
@@ -64,6 +65,14 @@ pub fn load_cart_from_str(source: &str, source_name: &str) -> Result<Box<dyn Car
     let palette = parse_palettes(&raw.palettes)?;
     let sprites = parse_sprites(&raw.sprites)?;
     let data = parse_data(&raw.data)?;
+    let sfx_bank = match raw.sfx.as_deref() {
+        Some(body) => parse_sfx(body).context("parsing __sfx__")?,
+        None => Box::new([Sfx::default(); SFX_COUNT]),
+    };
+    let music_bank = match raw.music.as_deref() {
+        Some(body) => parse_music(body).context("parsing __music__")?,
+        None => Box::new([Pattern::default(); MUSIC_COUNT]),
+    };
 
     let lua_code = raw.lua.unwrap_or_default();
     let lua = build_lua_state(&lua_code, source_name)?;
@@ -74,6 +83,8 @@ pub fn load_cart_from_str(source: &str, source_name: &str) -> Result<Box<dyn Car
         palette,
         sprites,
         data,
+        sfx_bank,
+        music_bank,
     }))
 }
 
@@ -205,6 +216,8 @@ struct RawCart {
     palettes: Vec<String>,
     sprites: Vec<String>,
     data: Vec<(String, String)>,
+    sfx: Option<String>,
+    music: Option<String>,
 }
 
 fn parse_omni(source: &str) -> Result<RawCart> {
@@ -277,6 +290,8 @@ fn parse_omni(source: &str) -> Result<RawCart> {
     let mut palettes: Vec<String> = Vec::new();
     let mut sprites: Vec<String> = Vec::new();
     let mut data: Vec<(String, String)> = Vec::new();
+    let mut sfx_section: Option<String> = None;
+    let mut music_section: Option<String> = None;
 
     for (name, arg, body) in sections {
         match (name.as_str(), arg.as_deref()) {
@@ -317,6 +332,20 @@ fn parse_omni(source: &str) -> Result<RawCart> {
                 data.push((arg.to_string(), body));
             }
             ("data", None) => bail!("__data__ requires a name argument"),
+            ("sfx", None) => {
+                if sfx_section.is_some() {
+                    bail!("duplicate __sfx__ section");
+                }
+                sfx_section = Some(body);
+            }
+            ("sfx", Some(_)) => bail!("__sfx__ takes no argument"),
+            ("music", None) => {
+                if music_section.is_some() {
+                    bail!("duplicate __music__ section");
+                }
+                music_section = Some(body);
+            }
+            ("music", Some(_)) => bail!("__music__ takes no argument"),
             ("source", None) => { /* documentation-only; ignore */ }
             (other, _) => {
                 eprintln!("[loader] warning: unknown section __{}__ (ignored)", other);
@@ -333,6 +362,8 @@ fn parse_omni(source: &str) -> Result<RawCart> {
         palettes,
         sprites,
         data,
+        sfx: sfx_section,
+        music: music_section,
     })
 }
 
@@ -375,6 +406,18 @@ fn is_valid_identifier(s: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Pull an optional integer-ish positional arg out of a Lua variadic. Returns
+/// `None` for missing or non-numeric slots — call sites supply their own
+/// defaults per SPEC §9.6.
+fn mv_as_i32(args: &Variadic<Value>, idx: usize) -> Option<i32> {
+    match args.get(idx)? {
+        Value::Integer(n) => Some(*n as i32),
+        Value::Number(n) => Some(*n as i32),
+        Value::Boolean(b) => Some(if *b { 1 } else { 0 }),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +692,225 @@ fn parse_data(items: &[(String, String)]) -> Result<HashMap<String, Vec<u8>>> {
 }
 
 // ---------------------------------------------------------------------------
+//  __sfx__ parser.
+// ---------------------------------------------------------------------------
+
+fn parse_sfx(body: &str) -> Result<Box<[Sfx; SFX_COUNT]>> {
+    use std::collections::HashSet;
+    let mut bank = Box::new([Sfx::default(); SFX_COUNT]);
+    let mut seen: HashSet<u8> = HashSet::new();
+
+    let cleaned = strip_hash_comments(body);
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    let mut i = 0;
+
+    while i < words.len() {
+        if words[i] != "sfx" {
+            bail!("__sfx__: unexpected token {:?} (expected `sfx`)", words[i]);
+        }
+        i += 1;
+
+        let id_str = words
+            .get(i)
+            .ok_or_else(|| anyhow!("__sfx__: missing ID after `sfx`"))?;
+        let id = u8::from_str_radix(id_str, 16)
+            .with_context(|| format!("__sfx__: bad hex ID {:?}", id_str))?;
+        if id as usize >= SFX_COUNT {
+            bail!(
+                "__sfx__: ID 0x{:02x} out of range (max 0x{:02x})",
+                id,
+                SFX_COUNT - 1
+            );
+        }
+        if !seen.insert(id) {
+            bail!("__sfx__: duplicate ID 0x{:02x}", id);
+        }
+        i += 1;
+
+        let name = words
+            .get(i)
+            .ok_or_else(|| anyhow!("__sfx__: missing NAME for sfx 0x{:02x}", id))?;
+        if !is_valid_identifier(name) {
+            bail!("__sfx__: invalid NAME {:?} for sfx 0x{:02x}", name, id);
+        }
+        i += 1;
+
+        // Metadata: k=v pairs in any order, until the first non-`k=v` token
+        // (which is the start of the step grid).
+        let mut speed: Option<u8> = None;
+        let mut loop_range: Option<(u8, u8)> = None;
+        while i < words.len() {
+            let w = words[i];
+            let Some(eq) = w.find('=') else {
+                break;
+            };
+            let (k, v) = (&w[..eq], &w[eq + 1..]);
+            match k {
+                "speed" => {
+                    let n: u8 = v
+                        .parse()
+                        .with_context(|| format!("__sfx__: bad speed value {:?}", v))?;
+                    if n == 0 {
+                        bail!("__sfx__: speed must be in 1..=255 (got 0)");
+                    }
+                    speed = Some(n);
+                }
+                "loop" => {
+                    if v == "none" {
+                        loop_range = Some((0, 0));
+                    } else {
+                        let (a, b) = v.split_once("..").ok_or_else(|| {
+                            anyhow!("__sfx__: bad loop value {:?} (expected A..B or none)", v)
+                        })?;
+                        let a: u8 = a
+                            .parse()
+                            .with_context(|| format!("__sfx__: bad loop start {:?}", a))?;
+                        let b: u8 = b
+                            .parse()
+                            .with_context(|| format!("__sfx__: bad loop end {:?}", b))?;
+                        if a as usize >= SFX_STEPS || b as usize >= SFX_STEPS {
+                            bail!(
+                                "__sfx__: loop indices must be in 0..{}",
+                                SFX_STEPS
+                            );
+                        }
+                        loop_range = Some((a, b));
+                    }
+                }
+                _ => bail!("__sfx__: unknown metadata key {:?}", k),
+            }
+            i += 1;
+        }
+        let speed = speed
+            .ok_or_else(|| anyhow!("__sfx__: sfx 0x{:02x} missing required `speed=`", id))?;
+        let (loop_start, loop_end) = loop_range
+            .ok_or_else(|| anyhow!("__sfx__: sfx 0x{:02x} missing required `loop=`", id))?;
+
+        // Step grid: exactly 32 4-char hex tokens.
+        let mut steps = [0u16; SFX_STEPS];
+        for step_idx in 0..SFX_STEPS {
+            let tok = words.get(i).ok_or_else(|| {
+                anyhow!(
+                    "__sfx__: sfx 0x{:02x}: only {} step tokens (need {})",
+                    id,
+                    step_idx,
+                    SFX_STEPS
+                )
+            })?;
+            if tok.len() != 4 || !tok.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!(
+                    "__sfx__: sfx 0x{:02x} step {}: expected 4-char hex, got {:?}",
+                    id,
+                    step_idx,
+                    tok
+                );
+            }
+            steps[step_idx] = u16::from_str_radix(tok, 16).unwrap();
+            i += 1;
+        }
+
+        bank[id as usize] = Sfx {
+            steps,
+            speed,
+            loop_start,
+            loop_end,
+        };
+    }
+
+    Ok(bank)
+}
+
+// ---------------------------------------------------------------------------
+//  __music__ parser.
+// ---------------------------------------------------------------------------
+
+fn parse_music(body: &str) -> Result<Box<[Pattern; MUSIC_COUNT]>> {
+    use std::collections::HashSet;
+    let mut bank = Box::new([Pattern::default(); MUSIC_COUNT]);
+    let mut seen: HashSet<u8> = HashSet::new();
+
+    for (line_no, raw) in body.lines().enumerate() {
+        let line = match raw.split_once('#') {
+            Some((before, _)) => before.trim(),
+            None => raw.trim(),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let (id_part, rest) = line.split_once(':').ok_or_else(|| {
+            anyhow!(
+                "__music__: line {}: expected `ID: FLAGS CH0 CH1 CH2 CH3`",
+                line_no + 1
+            )
+        })?;
+        let id_str = id_part.trim();
+        let id = u8::from_str_radix(id_str, 16).with_context(|| {
+            format!("__music__: line {}: bad hex ID {:?}", line_no + 1, id_str)
+        })?;
+        if id as usize >= MUSIC_COUNT {
+            bail!(
+                "__music__: line {}: ID 0x{:02x} out of range (max 0x{:02x})",
+                line_no + 1,
+                id,
+                MUSIC_COUNT - 1
+            );
+        }
+        if !seen.insert(id) {
+            bail!(
+                "__music__: line {}: duplicate ID 0x{:02x}",
+                line_no + 1,
+                id
+            );
+        }
+
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        if tokens.len() != 5 {
+            bail!(
+                "__music__: line {}: expected 5 tokens (flags + 4 channels), got {}",
+                line_no + 1,
+                tokens.len()
+            );
+        }
+        let flags = u8::from_str_radix(tokens[0], 16).with_context(|| {
+            format!("__music__: line {}: bad hex flags {:?}", line_no + 1, tokens[0])
+        })?;
+        if flags & 0xF8 != 0 {
+            bail!(
+                "__music__: line {}: reserved flag bits set (got 0x{:02x})",
+                line_no + 1,
+                flags
+            );
+        }
+        let mut channels = [0u8; 4];
+        for (i, t) in tokens[1..5].iter().enumerate() {
+            let v = u8::from_str_radix(t, 16).with_context(|| {
+                format!("__music__: line {}: bad hex ch{} {:?}", line_no + 1, i, t)
+            })?;
+            if v != 0xFF && v as usize >= SFX_COUNT {
+                bail!(
+                    "__music__: line {}: ch{} sfx id 0x{:02x} out of range (0x00..0x{:02x} or 0xFF)",
+                    line_no + 1,
+                    i,
+                    v,
+                    SFX_COUNT - 1
+                );
+            }
+            channels[i] = v;
+        }
+        bank[id as usize] = Pattern { flags, channels };
+    }
+
+    Ok(bank)
+}
+
+fn strip_hash_comments(s: &str) -> String {
+    s.lines()
+        .map(|l| l.split_once('#').map(|(b, _)| b).unwrap_or(l))
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
 //  Lua state setup.
 // ---------------------------------------------------------------------------
 
@@ -694,6 +956,8 @@ struct LuaCart {
     palette: Vec<(u8, u8, u8, u8)>,
     sprites: Vec<SpriteAsset>,
     data: HashMap<String, Vec<u8>>,
+    sfx_bank: Box<[Sfx; SFX_COUNT]>,
+    music_bank: Box<[Pattern; MUSIC_COUNT]>,
 }
 
 impl Cart for LuaCart {
@@ -715,6 +979,11 @@ impl Cart for LuaCart {
             api.set_persist_buffer(true);
         }
         api.cam_pitch(self.header.display.default_pitch);
+
+        // Push the audio banks before user code so `sfx(0)` from the cart's
+        // own `init` triggers the right SFX. Clone is cheap: 4352 + 640 bytes.
+        api.load_sfx_bank(self.sfx_bank.clone());
+        api.load_music_bank(self.music_bank.clone());
 
         let _ = self.run_lua_fn("init", api, |_lua| Ok(MultiValue::new()));
         // Lua errors abort the run; matches the renderer-init `expect` style.
@@ -878,6 +1147,30 @@ impl LuaCart {
             })?)?;
             g.set("rand", scope.create_function_mut(move |_, ()| {
                 Ok(api_cell.borrow_mut().rand())
+            })?)?;
+
+            // -- audio (SPEC §9.6) ---------------------------------------------
+            g.set("sfx", scope.create_function_mut(
+                move |_, args: Variadic<Value>| -> mlua::Result<()> {
+                    let n = mv_as_i32(&args, 0).unwrap_or(0);
+                    let ch = mv_as_i32(&args, 1).unwrap_or(-1);
+                    let offset = mv_as_i32(&args, 2).unwrap_or(0);
+                    api_cell.borrow_mut().sfx(n, ch, offset);
+                    Ok(())
+                },
+            )?)?;
+            g.set("music", scope.create_function_mut(
+                move |_, args: Variadic<Value>| -> mlua::Result<()> {
+                    let n = mv_as_i32(&args, 0).unwrap_or(0);
+                    let fade_ms = mv_as_i32(&args, 1).unwrap_or(0).max(0) as u32;
+                    let ch_mask = mv_as_i32(&args, 2).unwrap_or(15).clamp(0, 15) as u8;
+                    api_cell.borrow_mut().music(n, fade_ms, ch_mask);
+                    Ok(())
+                },
+            )?)?;
+            g.set("audio_master", scope.create_function_mut(move |_, vol: f32| {
+                api_cell.borrow_mut().audio_master(vol);
+                Ok(())
             })?)?;
 
             // -- print (rebound to api.print, variadic + tostring) -------------

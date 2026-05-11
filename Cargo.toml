@@ -17,6 +17,7 @@ mlua = { version = "0.10", features = ["lua54", "vendored"] }
 toml = "0.8"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
+cpal = "0.15"
 
 [profile.dev]
 opt-level = 1   # debug stays interactive at 128³

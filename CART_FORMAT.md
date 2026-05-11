@@ -29,6 +29,12 @@ __palette__
 __sprites__
 ...
 
+__sfx__
+...
+
+__music__
+...
+
 __data NAME__
 ...base64 blob...
 
@@ -64,7 +70,7 @@ Whitespace before/after the marker tokens is not permitted (`__ header __` is no
 
 - `__header__` MUST be the first section. The emulator parses it before allocating anything for the rest of the cart so it can reject an incompatible cart cheaply.
 - All other sections may appear in any order.
-- Sections that are not allowed to repeat: `__header__`, `__lua__`, `__wasm__`, `__source__`. The loader rejects duplicates.
+- Sections that are not allowed to repeat: `__header__`, `__lua__`, `__sfx__`, `__music__`, `__wasm__`, `__source__`. The loader rejects duplicates.
 - Sections that may repeat (at most once per `arg`): `__palette__`, `__sprites__`, `__data ARG__`. Bodies are concatenated in source order; for `__palette__` repeats, later overrides win.
 
 ### 1.4 Comments and whitespace
@@ -257,7 +263,193 @@ y=3
 
 (Palette index 1 here is just an example. Use the index that matches your intended color in the active palette.)
 
-## 6. `__data NAME__`
+## 6. `__sfx__`
+
+PICO-8-shaped sound effects bank. Up to **64 SFX slots** (indexed
+`0..63`), each a 32-step sequence plus 4 bytes of metadata. See
+`SPEC.md` §9.4 for the runtime semantics; this section defines only
+the on-disk text encoding.
+
+Undeclared slots are silent (all-zero bytes) — you only need to write
+the SFX you use.
+
+### 6.1 SFX header line
+
+```
+sfx ID NAME
+```
+
+- `ID`: 2-char hex integer in `[0x00, 0x3F]`. Selects the slot.
+  Case-insensitive; lowercase recommended.
+- `NAME`: identifier matching `[a-z][a-z0-9_]*`, ≤ 32 chars.
+  Documentation only in v0.1 (reserved for a future name-based
+  syscall, paralleling `__sprites__`).
+- Duplicate `ID` declarations within `__sfx__` are rejected.
+
+### 6.2 Metadata line
+
+```
+  speed=N loop=A..B
+```
+
+- `speed`: integer in `[1, 255]`. Engine-tick duration per step (see
+  `SPEC.md` §9.4). At `hz=60`, `speed=4` is 66.7 ms/step.
+- `loop`: two integers in `[0, 31]` separated by `..`. If
+  `B <= A`, the SFX plays once (no loop). The literal `loop=none`
+  is accepted as a synonym for `loop=0..0`.
+- The two fields may appear in any order. Trailing/leading
+  whitespace is permitted; key-value pairs are separated by any run
+  of whitespace.
+
+### 6.3 Step grid
+
+Exactly **32 steps** follow the metadata line, encoded as 4-character
+hex tokens separated by whitespace. Conventionally laid out as 4 rows
+of 8 tokens for readability:
+
+```
+  0010 0220 1340 0e00 0010 0220 1340 0e00
+  0010 0220 1340 0e00 0010 0220 1340 0e00
+  0010 0220 1340 0e00 0010 0220 1340 0e00
+  0010 0220 1340 0e00 0010 0220 1340 0e00
+```
+
+Any whitespace layout works — one token per line, all 32 on one
+line, 8 per row, etc. The loader accepts any whitespace-separated
+arrangement totalling exactly 32 tokens.
+
+Each token is a 16-bit big-endian integer (hex, case-insensitive,
+lowercase recommended) decoded as:
+
+| bits | field    | range | meaning |
+|---|---|---|---|
+| 15..10 | pitch    | 0..63 | chromatic, `SPEC.md` §9.4 |
+| 9..6   | waveform | 0..15 | 0..7 base, 8..15 = custom SFX `n-8` |
+| 5..3   | volume   | 0..7  | 0 = silent, 7 = max |
+| 2..0   | effect   | 0..7  | `SPEC.md` §9.3 |
+
+Tokens with a non-zero bit in positions outside that schema are
+rejected (forward-compat: don't claim reserved bits).
+
+### 6.4 Validation
+
+- Reject any step token that isn't exactly 4 hex characters.
+- Reject any SFX block whose step count is not exactly 32.
+- Reject `ID` outside `[0x00, 0x3F]`.
+- Reject `speed` outside `[1, 255]`.
+- Reject `loop` indices outside `[0, 31]`.
+- Reject SFX 0..7 (i.e. those usable as custom instruments) that
+  themselves use waveform values `8..15` — recursion is not
+  permitted; emit a load-time warning and substitute waveform 0
+  (triangle) at each offending step.
+
+### 6.5 Worked example
+
+A short "chomp" — a downward two-step pulse on the square wave:
+
+```
+__sfx__
+sfx 00 chomp
+  speed=2 loop=none
+  30d8 2cd8 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+```
+
+Decoding step 0 (`0x30d8`): pitch `0b001100 = 12` (C3), waveform
+`0b0011 = 3` (square), volume `0b011 = 3`, effect `0b000` (none).
+
+Step 1 (`0x2cd8`): pitch `0b001011 = 11` (B2), waveform 3 (square),
+volume 3, no effect.
+
+A second SFX in the same section just adds another `sfx ID NAME` block.
+Here a "death" — a falling triangle ladder with fade-out on every step:
+
+```
+__sfx__
+sfx 00 chomp
+  speed=2 loop=none
+  30d8 2cd8 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+sfx 01 death
+  speed=4 loop=none
+  301d 281d 201d 181d 101d 081d 001d 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+```
+
+## 7. `__music__`
+
+PICO-8-shaped pattern bank. Up to **128 patterns** (indexed
+`0x00..0x7F`), each a 5-byte record naming up to 4 SFXes (one per
+channel) plus a 1-byte flags field. See `SPEC.md` §9.5 for the
+runtime semantics — including how patterns chain into songs and
+how `music(n)` picks a song by its starting pattern.
+
+Undeclared patterns are inert.
+
+### 7.1 Line format
+
+Each non-comment line in `__music__` is one pattern:
+
+```
+ID: FLAGS CH0 CH1 CH2 CH3
+```
+
+- `ID`: 2-char hex integer in `[0x00, 0x7F]`. Case-insensitive;
+  lowercase recommended.
+- `FLAGS`: 2 hex chars (one byte). Bit 0 = begin-loop, bit 1 =
+  end-loop, bit 2 = stop-at-end, bits 3..7 reserved (must be 0).
+- `CH0..CH3`: 2 hex chars each. Each is an SFX id in `[0x00, 0x3F]`
+  or `0xFF` (silent channel). `0x40..0xFE` are rejected.
+- Whitespace around `:` and between fields is permitted (any run).
+- Comments (`#`) and blank lines are allowed between entries.
+- Duplicate `ID`s within `__music__` are rejected.
+
+### 7.2 Worked example
+
+Three songs packed into the same `__music__` section: a looped title
+(patterns 00..03), a looped battle theme (04..0b), and a one-shot
+game-over jingle (0c..0d).
+
+```
+__music__
+# id flags ch0 ch1 ch2 ch3
+
+# Title — looped, patterns 00..03.
+00:    01    00  01  ff  ff   # begin-loop
+01:    00    00  02  03  ff
+02:    00    00  02  03  ff
+03:    02    02  02  04  ff   # end-loop → jumps back to pattern 00
+
+# Battle — looped, patterns 04..0b.
+04:    01    05  06  07  ff   # begin-loop
+05:    00    05  06  07  ff
+# ... 06..0a omitted for brevity
+0b:    02    08  06  07  ff   # end-loop → jumps back to pattern 04
+
+# Game-over jingle — one-shot, patterns 0c..0d.
+0c:    00    09  0a  ff  ff
+0d:    04    09  0a  ff  ff   # stop-at-end → halts
+```
+
+Cart usage:
+
+```lua
+music(0x00)   -- title screen
+music(0x04)   -- when battle starts
+music(0x0c)   -- on death
+```
+
+Channels 2 and 3 marked `ff` stay free for `sfx()` calls from cart
+code on top of the music.
+
+## 8. `__data NAME__`
 
 A named base64 blob, accessible from the cart at runtime via `data_get("name")`.
 
@@ -273,7 +465,7 @@ WhULZc8j8GJsm7gmlhtKFvNdJlsf28zd6jL7vR6ORztu2bdv7+8XiJ7vd7r
 b9PB6P40+ej8eHGo3GwOC2bdv5fL4WCoVCWeyJI4Z+v9/v9z0eb7VanU5n
 ```
 
-## 7. `__wasm__` (reserved, v0.2)
+## 9. `__wasm__` (reserved, v0.2)
 
 Single base64 blob carrying a WebAssembly module. Required when `runtime.lang = "wasm"`. Mutually exclusive with `__lua__` (a cart with both is rejected).
 
@@ -284,7 +476,7 @@ __wasm__
 AGFzbQEAAAABBwFgAn9/AX8...
 ```
 
-## 8. `__source__` (optional, accompanies `__wasm__`)
+## 10. `__source__` (optional, accompanies `__wasm__`)
 
 Plain text source for a `__wasm__` cart, for hackability. Not parsed by the loader; ignored at runtime. Encouraged for any cart distributed in WASM form.
 
@@ -295,13 +487,13 @@ fn init(api: &mut CartApi) { ... }
 fn update(api: &mut CartApi, dt: f32) { ... }
 ```
 
-## 9. Forward compatibility
+## 11. Forward compatibility
 
 - Unknown sections (`__foo__`, `__foo bar__`) are warned-and-ignored at load.
 - Unknown TOML tables and keys in `__header__` are warned-and-ignored.
 - v0.x → v0.x+1 carts may break. v0.x → v(x+1).0 will require migration; the magic line's major is the gate.
 
-## 10. End-to-end example
+## 12. End-to-end example
 
 A minimal "spinning cube" cart that fills a 4³ region near the world center, using only on-the-fly `vox_set`:
 
