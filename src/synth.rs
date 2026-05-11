@@ -251,10 +251,7 @@ impl State {
             voices: [Voice::default(); VOICES],
             sfx_bank: Box::new([Sfx::default(); SFX_COUNT]),
             music_bank: Box::new([Pattern::default(); MUSIC_COUNT]),
-            // Conservative default — chiptune voices are full-amplitude before
-            // soft-clip, so 1.0 plays louder than typical media. Carts can
-            // raise via audio_master(vol).
-            master: 0.4,
+            master: 1.0,
             rx,
             noise_state: 0xDEAD_BEEF,
             music: MusicState::default(),
@@ -500,9 +497,10 @@ impl State {
     }
 
     fn mix_one_sample(&mut self) -> f32 {
-        // Sum each active voice at its own volume, then soft-clip. Vintage
-        // chiptune behavior: a single voice at vol=7 plays at full amplitude;
-        // multiple voices stack but never blow out the DAC.
+        // Average voices (sum / VOICES) so loudness stays consistent regardless
+        // of voice count, then soft-clip via tanh as a safety net for the rare
+        // case where music + sfx + custom-instrument all hit full amplitude.
+        // Master gain is applied on top — default in `State::new`.
         let mut sum = 0.0_f32;
         for vi in 0..VOICES {
             if !self.voices[vi].active {
@@ -513,7 +511,7 @@ impl State {
             self.advance_fade(vi);
         }
         self.advance_music();
-        (sum * self.master).tanh()
+        ((sum / VOICES as f32) * self.master).tanh()
     }
 
     fn synth_voice(&mut self, vi: usize) -> f32 {
