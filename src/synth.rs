@@ -13,8 +13,8 @@
 //!   + linear cross-fade (SPEC §9.5 / §9.6 `music()`)
 //! - sfx/music/audio_master command surface
 //!
-//! Not yet implemented (later phases):
-//! - Custom instruments (waveform values 8..15 — SPEC §9.2 last paragraph)
+//! - Custom instruments: waveform 8..15 plays SFX 0..7 as a transposable
+//!   voice (SPEC §9.2 last paragraph)
 
 use std::sync::mpsc;
 
@@ -191,6 +191,29 @@ struct Voice {
     eff_pitch_hz: f32,
     claimed_by_music: bool,
     fade: Option<FadeState>,
+    // Custom-instrument mode: when the host step has waveform 8..15, the voice
+    // plays the referenced SFX 0..7 transposed to the host pitch. While `child`
+    // is Some, host pitch/waveform/effect are dormant and synthesis reads from
+    // the child fields. Host step doesn't tick until the source completes.
+    child: Option<ChildState>,
+}
+
+#[derive(Clone, Copy)]
+struct ChildState {
+    src_id: u8,
+    src_step_idx: u8,
+    src_samples_in_step: u32,
+    src_samples_per_step: u32,
+    src_pitch_hz: f32,
+    src_volume: f32,
+    src_waveform: u8,
+    src_effect: u8,
+    src_prev_pitch_hz: f32,
+    src_recent_pitches: [f32; 4],
+    src_recent_idx: u8,
+    src_phase: f32,
+    transpose_ratio: f32,
+    vol_scale: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -312,6 +335,7 @@ impl State {
         v.eff_pitch_hz = v.pitch_hz;
         v.recent_pitches = [v.pitch_hz; 4];
         v.recent_idx = 1;
+        self.maybe_enter_child_mode(voice_idx);
         Some(voice_idx)
     }
 
@@ -496,9 +520,17 @@ impl State {
         let sample_rate = self.sample_rate;
         let (phase, waveform, eff_vol, fade_g) = {
             let v = &mut self.voices[vi];
-            let (p, vol) = apply_effect(v, sample_rate);
-            v.eff_pitch_hz = p;
-            (v.phase, v.waveform, vol, fade_gain(&v.fade))
+            let fg = fade_gain(&v.fade);
+            if let Some(c) = v.child.as_mut() {
+                let (p, vol) = apply_effect(&child_effect_in(c), sample_rate);
+                let eff_p = p * c.transpose_ratio;
+                v.eff_pitch_hz = eff_p;
+                (c.src_phase, c.src_waveform, vol * c.vol_scale, fg)
+            } else {
+                let (p, vol) = apply_effect(&voice_effect_in(v), sample_rate);
+                v.eff_pitch_hz = p;
+                (v.phase, v.waveform, vol, fg)
+            }
         };
         let wave = match waveform.min(7) {
             0 => triangle(phase),
@@ -540,14 +572,54 @@ impl State {
     }
 
     fn advance_voice(&mut self, vi: usize) {
-        let (sfx_id, sample_rate) = {
+        let sample_rate = self.sample_rate;
+        let in_child = self.voices[vi].child.is_some();
+        if in_child {
+            let (src_done, src_id) = {
+                let v = &mut self.voices[vi];
+                let c = v.child.as_mut().unwrap();
+                let phase_inc = v.eff_pitch_hz / sample_rate;
+                c.src_phase = (c.src_phase + phase_inc).fract();
+                c.src_samples_in_step += 1;
+                if c.src_samples_in_step < c.src_samples_per_step {
+                    return;
+                }
+                // Source step boundary. Push current pitch to recent ring,
+                // save prev, advance src_step_idx. Source loop is ignored
+                // (PICO-8 behavior): play once, then advance the host.
+                let prev_pitch = c.src_pitch_hz;
+                c.src_recent_pitches[c.src_recent_idx as usize % 4] = c.src_pitch_hz;
+                c.src_recent_idx = (c.src_recent_idx + 1) & 3;
+                c.src_prev_pitch_hz = prev_pitch;
+                c.src_samples_in_step = 0;
+                let next = c.src_step_idx as u32 + 1;
+                if next >= SFX_STEPS as u32 {
+                    (true, c.src_id)
+                } else {
+                    c.src_step_idx = next as u8;
+                    (false, c.src_id)
+                }
+            };
+            if !src_done {
+                let src = self.sfx_bank[src_id as usize];
+                let v = &mut self.voices[vi];
+                let c = v.child.as_mut().unwrap();
+                load_child_step(&src, c.src_step_idx, c, sample_rate);
+                return;
+            }
+            // Source finished: drop child mode and advance the host step.
+            self.voices[vi].child = None;
+        }
+        let (sfx_id, _) = {
             let v = &mut self.voices[vi];
-            let phase_inc = v.eff_pitch_hz / self.sample_rate;
-            v.phase = (v.phase + phase_inc).fract();
-            v.samples_in_step += 1;
-            (v.sfx_id, self.sample_rate)
+            if !in_child {
+                let phase_inc = v.eff_pitch_hz / sample_rate;
+                v.phase = (v.phase + phase_inc).fract();
+                v.samples_in_step += 1;
+            }
+            (v.sfx_id, sample_rate)
         };
-        let need_step_boundary = {
+        let need_step_boundary = in_child || {
             let v = &self.voices[vi];
             v.samples_in_step >= v.samples_per_step
         };
@@ -573,6 +645,51 @@ impl State {
         v.recent_pitches[v.recent_idx as usize % 4] = v.pitch_hz;
         v.recent_idx = (v.recent_idx + 1) & 3;
         v.samples_per_step = step_samples(sfx.speed, sample_rate);
+        // If the new host step is a custom instrument, enter child mode.
+        self.maybe_enter_child_mode(vi);
+    }
+
+    fn maybe_enter_child_mode(&mut self, vi: usize) {
+        let v = &self.voices[vi];
+        if v.waveform < 8 {
+            return;
+        }
+        let src_id = v.waveform - 8;
+        let src = self.sfx_bank[src_id as usize];
+        if src.speed == 0 {
+            // Silent source: stay in host mode and play a triangle at vol 0
+            // for one host step. Easier than fabricating an immediate advance
+            // mid-callback.
+            let v = &mut self.voices[vi];
+            v.waveform = 0;
+            v.volume = 0.0;
+            return;
+        }
+        let host_pitch_hz = v.pitch_hz;
+        let host_volume = v.volume;
+        let sample_rate = self.sample_rate;
+        let mut child = ChildState {
+            src_id,
+            src_step_idx: 0,
+            src_samples_in_step: 0,
+            src_samples_per_step: 1,
+            src_pitch_hz: 0.0,
+            src_volume: 0.0,
+            src_waveform: 0,
+            src_effect: 0,
+            src_prev_pitch_hz: 0.0,
+            src_recent_pitches: [0.0; 4],
+            src_recent_idx: 1,
+            src_phase: 0.0,
+            transpose_ratio: 1.0,
+            vol_scale: host_volume,
+        };
+        load_child_step(&src, 0, &mut child, sample_rate);
+        // Transpose so source step 0's pitch maps to the host step's pitch.
+        child.transpose_ratio = host_pitch_hz / child.src_pitch_hz;
+        child.src_prev_pitch_hz = child.src_pitch_hz;
+        child.src_recent_pitches = [child.src_pitch_hz; 4];
+        self.voices[vi].child = Some(child);
     }
 }
 
@@ -617,6 +734,20 @@ fn load_step(sfx: &Sfx, step_idx: u8, v: &mut Voice) {
     v.effect = effect;
 }
 
+fn load_child_step(src: &Sfx, step_idx: u8, c: &mut ChildState, sample_rate: f32) {
+    let raw = src.steps[step_idx as usize];
+    let pitch = ((raw >> 10) & 0x3F) as u8;
+    let waveform = ((raw >> 6) & 0x0F) as u8;
+    let volume = ((raw >> 3) & 0x07) as u8;
+    let effect = (raw & 0x07) as u8;
+    c.src_pitch_hz = pitch_to_hz(pitch);
+    // SFX 0..7 are clamped to base waveforms by the loader; defensively clamp.
+    c.src_waveform = waveform.min(7);
+    c.src_volume = volume as f32 / 7.0;
+    c.src_effect = effect;
+    c.src_samples_per_step = step_samples(src.speed, sample_rate);
+}
+
 // ---------------------------------------------------------------------------
 //  Per-step effects (SPEC §9.3). Returns the (pitch_hz, volume) for this
 //  sample. The pitch result is also stored on the voice for advance_voice.
@@ -627,27 +758,64 @@ const VIBRATO_SEMITONES: f32 = 0.5;
 const ARP_FAST_TICKS: f32 = 4.0;
 const ARP_SLOW_TICKS: f32 = 16.0;
 
-fn apply_effect(v: &Voice, sample_rate: f32) -> (f32, f32) {
-    let frac = v.samples_in_step as f32 / v.samples_per_step.max(1) as f32;
-    match v.effect {
-        1 => (v.prev_pitch_hz + (v.pitch_hz - v.prev_pitch_hz) * frac, v.volume),
+struct EffectIn {
+    effect: u8,
+    pitch_hz: f32,
+    prev_pitch_hz: f32,
+    volume: f32,
+    samples_in_step: u32,
+    samples_per_step: u32,
+    recent_pitches: [f32; 4],
+    recent_idx: u8,
+}
+
+fn apply_effect(e: &EffectIn, sample_rate: f32) -> (f32, f32) {
+    let frac = e.samples_in_step as f32 / e.samples_per_step.max(1) as f32;
+    match e.effect {
+        1 => (e.prev_pitch_hz + (e.pitch_hz - e.prev_pitch_hz) * frac, e.volume),
         2 => {
-            let t = v.samples_in_step as f32 / sample_rate;
+            let t = e.samples_in_step as f32 / sample_rate;
             let lfo = (2.0 * std::f32::consts::PI * VIBRATO_HZ * t).sin();
             let mult = 2.0_f32.powf(VIBRATO_SEMITONES * lfo / 12.0);
-            (v.pitch_hz * mult, v.volume)
+            (e.pitch_hz * mult, e.volume)
         }
-        3 => (v.pitch_hz * (1.0 - 0.5 * frac), v.volume),
-        4 => (v.pitch_hz, v.volume * frac),
-        5 => (v.pitch_hz, v.volume * (1.0 - frac)),
+        3 => (e.pitch_hz * (1.0 - 0.5 * frac), e.volume),
+        4 => (e.pitch_hz, e.volume * frac),
+        5 => (e.pitch_hz, e.volume * (1.0 - frac)),
         6 | 7 => {
-            let ticks = if v.effect == 6 { ARP_FAST_TICKS } else { ARP_SLOW_TICKS };
+            let ticks = if e.effect == 6 { ARP_FAST_TICKS } else { ARP_SLOW_TICKS };
             let samples_per_slot = (ticks / ENGINE_HZ) * sample_rate;
-            let slot = ((v.samples_in_step as f32 / samples_per_slot) as usize) & 3;
-            let newest = v.recent_idx.wrapping_sub(1) as usize & 3;
-            (v.recent_pitches[(newest + 4 - slot) & 3], v.volume)
+            let slot = ((e.samples_in_step as f32 / samples_per_slot) as usize) & 3;
+            let newest = e.recent_idx.wrapping_sub(1) as usize & 3;
+            (e.recent_pitches[(newest + 4 - slot) & 3], e.volume)
         }
-        _ => (v.pitch_hz, v.volume),
+        _ => (e.pitch_hz, e.volume),
+    }
+}
+
+fn voice_effect_in(v: &Voice) -> EffectIn {
+    EffectIn {
+        effect: v.effect,
+        pitch_hz: v.pitch_hz,
+        prev_pitch_hz: v.prev_pitch_hz,
+        volume: v.volume,
+        samples_in_step: v.samples_in_step,
+        samples_per_step: v.samples_per_step,
+        recent_pitches: v.recent_pitches,
+        recent_idx: v.recent_idx,
+    }
+}
+
+fn child_effect_in(c: &ChildState) -> EffectIn {
+    EffectIn {
+        effect: c.src_effect,
+        pitch_hz: c.src_pitch_hz,
+        prev_pitch_hz: c.src_prev_pitch_hz,
+        volume: c.src_volume,
+        samples_in_step: c.src_samples_in_step,
+        samples_per_step: c.src_samples_per_step,
+        recent_pitches: c.src_recent_pitches,
+        recent_idx: c.src_recent_idx,
     }
 }
 

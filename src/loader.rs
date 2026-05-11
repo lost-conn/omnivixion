@@ -817,6 +817,23 @@ fn parse_sfx(body: &str) -> Result<Box<[Sfx; SFX_COUNT]>> {
         };
     }
 
+    // SPEC §9.2: SFX 0..7 are the legal targets of custom-instrument
+    // waveforms 8..15 and may not themselves use 8..15 (no recursion).
+    // Substitute waveform 0 (triangle) at offending steps with a warning.
+    for id in 0..8usize {
+        for step_idx in 0..SFX_STEPS {
+            let step = bank[id].steps[step_idx];
+            let waveform = ((step >> 6) & 0x0F) as u8;
+            if waveform >= 8 {
+                eprintln!(
+                    "[loader] warning: __sfx__ sfx 0x{:02x} step {}: SFX 0..7 cannot use custom instruments; substituting waveform 0 (triangle)",
+                    id, step_idx
+                );
+                bank[id].steps[step_idx] = step & !0x03C0;
+            }
+        }
+    }
+
     Ok(bank)
 }
 

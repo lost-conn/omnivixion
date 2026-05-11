@@ -1,0 +1,72 @@
+omnivixion cart v0.1
+
+__header__
+[meta]
+spec   = "0.1"
+name   = "Custom Instruments"
+author = "seth"
+desc   = "waveform 8..15 = SFX 0..7 as a transposable voice; SPEC §9.2"
+
+[runtime]
+lang = "lua"
+hz   = 60
+
+[display]
+default_pitch  = 30
+persist_buffer = false
+
+__sfx__
+# SFX 0 — a tonal envelope used as a "patch" by SFX 0x10. Four steps:
+# a hard pulse attack, then a triangle decay across three steps. The
+# pitch (24 = C4) is the *reference* pitch — when SFX 0x10 plays this
+# patch at pitch 36 (C5), every step transposes up by +12 semitones.
+#
+#   step 0: pitch=24 (C4), wave=4 (pulse), vol=7, eff=0    -> 0x6138
+#   step 1: pitch=24,      wave=0 (tri),   vol=5, eff=0    -> 0x6028
+#   step 2: pitch=24,      wave=0 (tri),   vol=3, eff=0    -> 0x6018
+#   step 3: pitch=24,      wave=0 (tri),   vol=1, eff=5 (fade-out)
+#                                                          -> 0x600d
+sfx 00 patch
+  speed=2 loop=none
+  6138 6028 6018 600d 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+# SFX 0x10 — a "song" of four notes that each play SFX 0 as their voice.
+# waveform=8 means "play SFX 0 (= 8 - 8) transposed to this step's pitch".
+# speed=20 is wide enough that each note covers SFX 0's full 4-step
+# envelope before the host step advances.
+#
+#   step 0: pitch=36 (C5), wave=8 (=SFX 0), vol=7, eff=0   -> 0x9238
+#   step 1: pitch=40 (E5), wave=8,          vol=7, eff=0   -> 0xa238
+#   step 2: pitch=43 (G5), wave=8,          vol=7, eff=0   -> 0xae38
+#   step 3: pitch=36 (C5), wave=8,          vol=7, eff=0   -> 0x9238
+sfx 10 song
+  speed=20 loop=0..3
+  9238 a238 ae38 9238 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 0000 0000
+
+__lua__
+-- Custom-instrument demo: SFX 0x10 plays a C-E-G-C pattern where each
+-- note is voiced by SFX 0 (a pulse-attack-then-triangle-decay envelope),
+-- transposed up an octave from SFX 0's reference pitch.
+--
+-- Press btnp(0) (A) to retrigger.
+
+function init()
+  print("custom-instrument demo: SFX 0x10 voiced by SFX 0")
+  print("press A to retrigger")
+  for i = 0, 3 do
+    vox_set(56 + i * 4, 32, 64, 9 + i)
+  end
+  sfx(0x10)
+end
+
+function update(dt)
+  if btnp(0) then
+    sfx(0x10)
+  end
+end
