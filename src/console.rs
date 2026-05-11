@@ -600,10 +600,8 @@ impl CartApi for Console {
         });
     }
 
-    fn music(&mut self, _n: i32, _fade_ms: u32, _ch_mask: u8) {
-        // Music sequencer lands in a later phase. Lua binding is wired so carts
-        // can call music() without an undefined-global error; the call is a
-        // no-op until the sequencer is in.
+    fn music(&mut self, n: i32, fade_ms: u32, ch_mask: u8) {
+        self.audio_send(AudioCmd::SetMusic { n, fade_ms, ch_mask });
     }
 
     fn audio_master(&mut self, vol: f32) {
