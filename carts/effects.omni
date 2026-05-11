@@ -108,10 +108,13 @@ function init()
 end
 
 function update(dt)
+  -- Pin to channel 0 so each press stomps the previous demo SFX; otherwise
+  -- the default ch=-1 picks a free voice and effects pile up on top of
+  -- each other.
   for i = 0, 7 do
     if btnp(i) then
       print("sfx " .. i)
-      sfx(i)
+      sfx(i, 0)
     end
   end
 end
